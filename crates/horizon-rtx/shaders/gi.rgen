@@ -81,7 +81,8 @@ layout(set = 0, binding = 24) readonly buffer Cache { uint w[]; } cache;
 // `sprite_split` as sun.rahit's; `flags` bit 0: reorder the threads (`HORIZON_RT_SER=0` clears it,
 // to time what the reordering gives); bits 2 and 3: the kernel's `GI_TURN_BITS` (2 or 3); bit 4:
 // the kernel's `SKIP` 16 (the bounced light never rests); bit 5: its `SKIP_GI_JACOBIAN` (the
-// neighbours' samples with a Jacobian of 1, as before).
+// neighbours' samples with a Jacobian of 1, as before); bit 6: its `SKIP_NORMAL_NEAREST` (a
+// pixel's normal from its nearer neighbours, as before).
 layout(push_constant) uniform Push { uint sprite_split; uint flags; } push;
 
 // sun.rahit sets it below 0 when a ray met a translucent quad (and let it through).
@@ -183,6 +184,16 @@ vec3 surface_normal(ivec2 p, vec3 pos) {
     vec3 u = pos - surface_at(p - ivec2(0, 1));
     vec3 dx = dot(r, r) < dot(l, l) ? r : l;
     vec3 dy = dot(d, d) < dot(u, u) ? d : u;
+    // The kernel's: the side whose next pixel goes on in the same plane (bit 6 of the flags, the
+    // kernel's `SKIP_NORMAL_NEAREST`: the nearer, as before).
+    if ((push.flags & 64u) == 0u) {
+        vec3 er = surface_at(p + ivec2(2, 0)) - pos - 2.0 * r;
+        vec3 el = pos - 2.0 * l - surface_at(p - ivec2(2, 0));
+        vec3 ed = surface_at(p + ivec2(0, 2)) - pos - 2.0 * d;
+        vec3 eu = pos - 2.0 * u - surface_at(p - ivec2(0, 2));
+        dx = dot(er, er) < dot(el, el) ? r : l;
+        dy = dot(ed, ed) < dot(eu, eu) ? d : u;
+    }
     vec3 n = normalize(cross(dx, dy));
     return dot(n, pos) > 0.0 ? -n : n;
 }

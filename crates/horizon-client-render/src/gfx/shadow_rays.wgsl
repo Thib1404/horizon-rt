@@ -1132,6 +1132,9 @@ const GI_HISTORY: f32 = 20.0;
 // corner) then counted as much of this pixel's view as of the neighbour's, its light smeared in
 // streaks from the corner and burning in fireflies along it.
 const SKIP_GI_JACOBIAN: u32 = 16777216u;
+// `HORIZON_RT_SKIP`'s bit for a pixel's normal from its nearer neighbours, as before
+// (`surface_normal`).
+const SKIP_NORMAL_NEAREST: u32 = 67108864u;
 // The most a neighbour's sample may weigh more, or less, for being seen from this pixel (RTXDI's
 // and Remix's bound): past it the two points see the sample too differently to share it.
 const GI_JACOBIAN_MAX: f32 = 10.0;
@@ -1819,8 +1822,21 @@ fn surface_normal(p: vec2<i32>, pos: vec3<f32>) -> vec3<f32> {
     let l = pos - surface_at(p - vec2(1, 0));
     let d = surface_at(p + vec2(0, 1)) - pos;
     let u = pos - surface_at(p - vec2(0, 1));
-    let dx = select(l, r, dot(r, r) < dot(l, l));
-    let dy = select(u, d, dot(d, d) < dot(u, u));
+    var dx = select(l, r, dot(r, r) < dot(l, l));
+    var dy = select(u, d, dot(d, d) < dot(u, u));
+    // Each way, the side whose next pixel goes on in the same plane (the depth's straight line
+    // through two neighbours, after Wronski and atyuwen), not the nearer one: at a room's inner
+    // corner the wall's pixel can be the nearer, and the face's last pixels took a normal halfway
+    // between the ceiling's and the wall's, lit as neither (fireflies along the seam).
+    // `SKIP_NORMAL_NEAREST`: the nearer, as before.
+    if (SKIP & SKIP_NORMAL_NEAREST) == 0u {
+        let er = surface_at(p + vec2(2, 0)) - pos - 2.0 * r;
+        let el = pos - 2.0 * l - surface_at(p - vec2(2, 0));
+        let ed = surface_at(p + vec2(0, 2)) - pos - 2.0 * d;
+        let eu = pos - 2.0 * u - surface_at(p - vec2(0, 2));
+        dx = select(l, r, dot(er, er) < dot(el, el));
+        dy = select(u, d, dot(ed, ed) < dot(eu, eu));
+    }
     let n = normalize(cross(dx, dy));
     return select(n, -n, dot(n, pos) > 0.0);
 }
