@@ -80,7 +80,8 @@ layout(set = 0, binding = 23) uniform utexture2D last_gi_b;
 layout(set = 0, binding = 24) readonly buffer Cache { uint w[]; } cache;
 // `sprite_split` as sun.rahit's; `flags` bit 0: reorder the threads (`HORIZON_RT_SER=0` clears it,
 // to time what the reordering gives); bits 2 and 3: the kernel's `GI_TURN_BITS` (2 or 3); bit 4:
-// the kernel's `SKIP` 16 (the bounced light never rests).
+// the kernel's `SKIP` 16 (the bounced light never rests); bit 5: its `SKIP_GI_JACOBIAN` (the
+// neighbours' samples with a Jacobian of 1, as before).
 layout(push_constant) uniform Push { uint sprite_split; uint flags; } push;
 
 // sun.rahit sets it below 0 when a ray met a translucent quad (and let it through).
@@ -469,6 +470,20 @@ GiSample last_gi(ivec2 at, out float weight, out float seen) {
     return GiSample(a.xyz - rt.motion.xyz, normal, vec3(rg, bm.x));
 }
 const float GI_HISTORY = 20.0;
+// The kernel's `GI_JACOBIAN_MAX` and `gi_jacobian`.
+const float GI_JACOBIAN_MAX = 10.0;
+float gi_jacobian(GiSample s, vec3 from, vec3 to) {
+    vec3 a = s.at - from;
+    vec3 b = s.at - to;
+    float da = dot(a, a);
+    float db = dot(b, b);
+    if (da > 4000.0 * 4000.0 * 0.25) return 1.0;
+    if (da < 1e-8 || db < 1e-8) return 0.0;
+    float cos_from = abs(dot(s.normal, a)) * inversesqrt(da);
+    float cos_to = abs(dot(s.normal, b)) * inversesqrt(db);
+    if (cos_from < 1e-4) return 0.0;
+    return cos_to * da / (cos_from * db);
+}
 
 // The kernel's `sharp`: whether mask texel `texel` is in the sharp zone (VR's fovea, `rt.fovea`),
 // from its view ray. Only there does the kernel read the pass (`sun_from_pass`: `cs_shadow` traces
@@ -541,9 +556,16 @@ void main() {
                                 continue;
                             }
                         }
+                        // The kernel's Jacobian: the neighbour's point from this frame's depth.
+                        float jacobian = 1.0;
+                        if (j > 0 && (push.flags & 32u) == 0u) {
+                            vec3 there = surface_at((texel + off) * scale + scale / 2) + (from - pos);
+                            jacobian = gi_jacobian(q, there, from);
+                            if (jacobian > GI_JACOBIAN_MAX || jacobian < 1.0 / GI_JACOBIAN_MAX) continue;
+                        }
                         float pt = gi_target(q, from, n);
                         float m = min(q_seen, j == 0 ? GI_HISTORY : GI_HISTORY / 4.0);
-                        float w = pt * q_weight * m;
+                        float w = pt * q_weight * m * jacobian;
                         sum += w;
                         seen += m;
                         u = fract(u + vec2(0.618034, 0.754878));

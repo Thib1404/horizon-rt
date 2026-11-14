@@ -96,7 +96,8 @@ pub struct SunPass {
     /// Which ray generations run.
     kinds: Kinds,
     /// The push constants' flags (bit 0: reorder, bit 1: the wind, bits 2 and 3: the bounced
-    /// light's turns as the kernel's `GI_TURN_BITS`, bit 4: the kernel's `SKIP` 16, no resting).
+    /// light's turns as the kernel's `GI_TURN_BITS`, bit 4: the kernel's `SKIP` 16, no resting,
+    /// bit 5: its `SKIP_GI_JACOBIAN`).
     flags: u32,
     /// The outputs, a texel a ray, the mask's size: the sun's light through (`Rgba16Float`), the
     /// bounce pass's hit and what it is (`Rgba32Float`) and its face, colour and sun light
@@ -406,6 +407,9 @@ impl SunPass {
             pass.flags = u32::from(reorder()) | if wind_skipped() { 0 } else { 2 };
             // Bits 2 and 3, bit 4: gi.rgen rests its tiles on the kernel's own turns.
             pass.flags |= gi_turn_bits() << 2 | if skipped(16) { 16 } else { 0 };
+            // Bit 5: the neighbours' samples with a Jacobian of 1, as before (HORIZON_RT_SKIP bit
+            // 16777216, the kernel's `SKIP_GI_JACOBIAN`).
+            pass.flags |= if skipped(16_777_216) { 32 } else { 0 };
             log::info!(
                 "Horizon RTX: a ray tracing pipeline for {}{}{}, shader execution reordering {}",
                 if kinds.sun { "the sun pass" } else { "" },

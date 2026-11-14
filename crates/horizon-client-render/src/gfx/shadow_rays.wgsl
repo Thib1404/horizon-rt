@@ -1127,6 +1127,30 @@ fn last_gi(at: vec2<i32>) -> GiReservoir {
     return GiReservoir(s, a.w, bm.y);
 }
 const GI_HISTORY: f32 = 20.0;
+// `HORIZON_RT_SKIP`'s bit for the neighbours' samples taken as if seen from this pixel's own point
+// (their Jacobian 1), as before: a sample a neighbour found right beside it (a wall's foot, a
+// corner) then counted as much of this pixel's view as of the neighbour's, its light smeared in
+// streaks from the corner and burning in fireflies along it.
+const SKIP_GI_JACOBIAN: u32 = 16777216u;
+// The most a neighbour's sample may weigh more, or less, for being seen from this pixel (RTXDI's
+// and Remix's bound): past it the two points see the sample too differently to share it.
+const GI_JACOBIAN_MAX: f32 = 10.0;
+// ReSTIR GI's Jacobian (Ouyang et al. 2021, eq. 11): how much larger the solid angle of sample
+// `s`'s surface is seen from camera-relative `to` than from `seer`, where the neighbour found it
+// (the cosines at the sample's face, the inverse squares of the distances); 0 where either point
+// lies in the sample's plane. The sky's samples are directions: 1.
+fn gi_jacobian(s: GiSample, seer: vec3<f32>, to: vec3<f32>) -> f32 {
+    let a = s.at - seer;
+    let b = s.at - to;
+    let da = dot(a, a);
+    let db = dot(b, b);
+    if da > 4000.0 * 4000.0 * 0.25 { return 1.0; }
+    if da < 1e-8 || db < 1e-8 { return 0.0; }
+    let cos_from = abs(dot(s.normal, a)) * inverseSqrt(da);
+    let cos_to = abs(dot(s.normal, b)) * inverseSqrt(db);
+    if cos_from < 1e-4 { return 0.0; }
+    return cos_to * da / (cos_from * db);
+}
 fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>, has_last: bool)
     -> vec4<f32> {
     // The bounce pass's reservoir where it made one: the light it stands for, as below.
@@ -1170,14 +1194,22 @@ fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>,
                     continue;
                 }
             }
-            // A neighbour a few texels away sees the sample from about the same point: the solid
-            // angle's change (the Jacobian) is taken as 1 (a gap from Remix's exact one, which
-            // needs the neighbour's own point; the visibility ray below keeps it honest).
+            // A neighbour's sample seen from this pixel's point: the solid angle's change (the
+            // Jacobian, as Remix's), from the neighbour's point as this frame's depth shows it
+            // (its texel lifted as this one), a sample it saw at a grazing angle or far closer
+            // than here (the wall beside a corner) left out. `SKIP_GI_JACOBIAN`: 1, as before.
+            var jacobian = 1.0;
+            if j > 0 && (SKIP & SKIP_GI_JACOBIAN) == 0u {
+                let lift = pos - surface_at(pixel_of(texel));
+                let there = surface_at(pixel_of(texel + off)) + lift;
+                jacobian = gi_jacobian(q.s, there, pos);
+                if jacobian > GI_JACOBIAN_MAX || jacobian < 1.0 / GI_JACOBIAN_MAX { continue; }
+            }
             let p = gi_target(q.s, pos, n);
             // The neighbours' history counts for less than the pixel's own (no blotches of one
             // sample spread over a patch).
             let m = min(q.seen, select(GI_HISTORY / 4.0, GI_HISTORY, j == 0));
-            let w = p * q.weight * m;
+            let w = p * q.weight * m * jacobian;
             sum += w;
             seen += m;
             u = fract(u + vec2(0.618034, 0.754878));
