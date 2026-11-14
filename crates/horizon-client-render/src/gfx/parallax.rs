@@ -481,7 +481,8 @@ fn parallax_rt(in: ParallaxOut) -> bool {
     return horizon_terrain_globals.rt_mode.x > 0.5 && horizon_terrain_linear_on()
         && in.emission == 0u;
 }
-// RT lighting: the sun's light through a thin material (`intensity`, 0..1: how much it scatters)
+// RT lighting: the sun's light and the sky's (terrain.wgsl `rt_sky_behind`) through a thin
+// material (`intensity`, 0..1: how much it scatters)
 // in the colour `tint` (linear), added to what `rt_material_lit` gives for the material without
 // its own subsurface term (terrain.wgsl's `rt_shade` has no tint to give it). It is lit where the
 // face turns away from the sun, as `rt_shade`'s is, and fogged as `rt_material_lit` fogs: the
@@ -496,7 +497,8 @@ fn parallax_transmission(in: ParallaxOut, geo: vec3<f32>, tint: vec3<f32>, inten
     let sun = g.rt_sun_light.rgb * g.rt_light.w * v.x
         * horizon_terrain_rt_sun_colour(in.clip.xy, v.x);
     let gate = smoothstep(0.0, 0.15, dot(geo, l));
-    let through = sun * tint * (intensity * SSS_ENERGY * max(dot(-geo, l), 0.0) * (1.0 - gate));
+    let through = (sun * (max(dot(-geo, l), 0.0) * (1.0 - gate))
+        + horizon_terrain_rt_sky_behind(geo, in.light.x)) * tint * (intensity * SSS_ENERGY);
     let air = vec3(5.802e-3 + 4.44e-3, 13.558e-3 + 4.44e-3, 33.1e-3 + 4.44e-3);
     let extinction = exp(-air * (length(in.position) * 0.001 * g.rt_mode.w));
     let f = horizon_terrain_fog_amount(in.spherical, in.cylindrical) * g.fog_color.a;

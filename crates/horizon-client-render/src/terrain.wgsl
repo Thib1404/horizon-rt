@@ -78,7 +78,8 @@ struct Globals {
     // and the wet shore are on (1 and more; gfx.rs `rt_shore`), its fraction the ambient light.
     earth: vec4<f32>,
     // The shooting stars' shower (`meteor_make`): its radiant (equatorial, xyz) and zenithal hourly
-    // rate (w); its meteors' speed (km/s, x) and population index (y), the sporadic rate (z).
+    // rate (w); its meteors' speed (km/s, x) and population index (y), the sporadic rate (z);
+    // w the forest fixes' off switches (`rt_old`).
     rt_shower: vec4<f32>,
     rt_stream: vec4<f32>,
     // RT lighting's rain (rain.rs): x its rate in mm/h (0 without the drops), y how wet the shaded
@@ -1681,11 +1682,42 @@ fn rt_labpbr(albedo: vec3<f32>, n: vec3<f32>, ao: f32, s: vec4<f32>) -> RtMateri
 fn rt_fresnel(f0: vec3<f32>, cosine: f32) -> vec3<f32> {
     return f0 + (1.0 - f0) * pow(1.0 - clamp(cosine, 0.0, 1.0), 5.0);
 }
+// Whether the forest fix `bit` is switched off (gfx/rt_switches.rs `rt_forest_bits`): 1 the sky's
+// reflection by `rt_env_brdf`, 2 the sky's light through leaves (gfx/parallax.rs
+// `parallax_transmission`).
+fn rt_old(bit: u32) -> bool {
+    return (u32(max(globals.rt_stream.w, 0.0) + 0.5) & bit) != 0u;
+}
+// How much of the light around a face (the sky's) its specular lobe reflects toward the eye, over
+// the whole lobe, not the mirror direction alone: the split-sum's environment BRDF (Karis 2014,
+// "Physically based shading on mobile", after Lazarov 2013), for perceptual `roughness` at the
+// view's cosine `nv`. Schlick's Fresnel at `nv` is a mirror's: on a rough face seen at a grazing
+// angle it reflected up to a third of the sky (f0 0.04: 0.016 here), and toward a low sun every
+// leaf and blade of grass caught the bright sky as frost.
+fn rt_env_brdf(f0: vec3<f32>, roughness: f32, nv: f32) -> vec3<f32> {
+    let c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    let r = clamp(roughness, 0.0, 1.0) * c0 + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * nv)) * r.x + r.y;
+    let ab = vec2(-1.04, 1.04) * a004 + r.zw;
+    return clamp(f0 * ab.x + ab.y, vec3(0.0), vec3(1.0));
+}
 // The sky light reaching a face by its sky light level (`light.x`, 0 to 15 as the vertex gives it:
 // `terrain_vertex`, vanilla's lightmap coordinates over 16), where no ray says how much of the
 // sky it sees: the level's share of full daylight, squared.
 fn rt_sky_level(level: f32) -> f32 {
     return pow(clamp(level / 15.0, 0.0, 1.0), 2.0);
+}
+// The sky's light on the far side of a thin face of normal `geo` (a leaf's, a plant's) by its sky
+// light level `level` (0 to 15): no ray goes there, so from the dome as past the grid (`rt_shade`'s
+// `by_level`), seen from the far side's normal. A leaf's underside under a canopy sees little sky
+// itself but the leaf over it is lit, and the light comes through green: without it the
+// undersides were black against the bright air (HORIZON_RT_LEAF_SKY=0, `rt_old` 2).
+fn rt_sky_behind(geo: vec3<f32>, level: f32) -> vec3<f32> {
+    if rt_old(2u) { return vec3(0.0); }
+    let back = -geo;
+    let dome = select(mix(0.6, 1.0, back.y), mix(0.6, 0.25, -back.y), back.y < 0.0);
+    return rt_sky(normalize(back + vec3(0.0, 1.0, 0.0))) * (rt_sky_level(level) * dome);
 }
 // RT lighting: how much of the sun's (or the moon's) light the clouds let through to the
 // camera-relative `pos` (gfx/rt_clouds.rs `shadow`), softened by the penumbra the light's disc
@@ -1762,6 +1794,8 @@ fn rt_shade(m: RtMaterial, geo: vec3<f32>, pos: vec3<f32>, light: vec2<f32>, v: 
     // by the leaf on its way in and out (its colour twice: a deeper green than its face's).
     let through = diffuse * m.albedo * m.subsurface * 0.35 * max(dot(-geo, l), 0.0)
         * (1.0 - gate);
+    // And the sky's light on its far side, the same way (`rt_sky_behind`).
+    let through_sky = diffuse * m.albedo * m.subsurface * 0.35 * rt_sky_behind(geo, light.x);
     // The sky and the light sources: traced (`traced`, the sky's light seen through rays in every
     // direction, accumulated), or past the grid from the light levels: the sky from where the face
     // sees most of it, between its normal and the zenith, as much as its sky light level says,
@@ -1780,7 +1814,9 @@ fn rt_shade(m: RtMaterial, geo: vec3<f32>, pos: vec3<f32>, light: vec2<f32>, v: 
     let around = mix(by_level, traced.rgb * m.ao, clamp(traced.a, 0.0, 1.0));
     // Reflected: the sky the way the view bounces off the surface, as much as Fresnel says (the
     // rougher, the less of it).
-    let ambient_f = rt_fresnel(m.f0, nv) * (1.0 - m.roughness * 0.7);
+    // (HORIZON_RT_SKY_FRESNEL=old: Schlick's at the view's angle, less 70 % of it fully rough.)
+    let ambient_f = select(rt_env_brdf(m.f0, m.roughness, nv),
+        rt_fresnel(m.f0, nv) * (1.0 - m.roughness * 0.7), rt_old(1u));
     // The reflection fades as it dips under the face (horizon fading): a normal map's facet
     // turned away would otherwise reflect the bright horizon from inside the surface, the walls
     // of a plank's grooves glittering at sunset.
@@ -1807,7 +1843,8 @@ fn rt_shade(m: RtMaterial, geo: vec3<f32>, pos: vec3<f32>, light: vec2<f32>, v: 
     }
     // The snow's crystals that catch the sun toward the eye (`rt_snow`).
     let sparkle = sun * (rt_sparkle * gate);
-    return sun * (direct + through) + highlight + sparkle + diffuse * (1.0 - ambient_f) * around
+    return sun * (direct + through) + through_sky + highlight + sparkle
+        + diffuse * (1.0 - ambient_f) * around
         + reflected
         + m.albedo * m.emission * MATERIAL_EMISSION + spray;
 }
