@@ -28,7 +28,9 @@ fn hw_refract(p: vec2<i32>) -> vec4<f32> {
         // The reflected ray starts on the camera's side of the surface, in the water.
         start = at + n * 0.02;
     }
+    hw_leaves_pass = false;
     let h = hw_hit(start, bent, 256.0);
+    hw_leaves_pass = true;
     if h.t < 0.0 {
         // Into deep water, or through the surface to the sky (from below).
         if inside { return vec4(0.0, 0.0, 0.0, 64.0); }
@@ -175,7 +177,9 @@ fn hw_refract_glass(ray: vec3<f32>) -> vec4<f32> {
         let sigma = ice_extinction(glass_ice > 1.5);
         beam *= luminance(exp(-sigma * inside));
     }
+    hw_leaves_pass = false;
     let h = hw_hit(pos, dir, 256.0);
+    hw_leaves_pass = true;
     var seen_light = vec3(0.0);
     if h.t < 0.0 {
         seen_light = absorbed * (sky_at(dir) * h.through + hw_water_glint(h, dir));

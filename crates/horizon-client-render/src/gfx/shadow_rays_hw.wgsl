@@ -146,7 +146,32 @@ fn hw_opaque(c: RayIntersection) -> bool {
     } else {
         texel = hw_texel(c, base);
     }
-    return texel.a < 0.0 || texel.a >= 0.5;
+    if texel.a < 0.0 { return true; }
+    return texel.a >= 0.5 && !hw_leaf_pass(c, base);
+}
+// Whether the ray goes on through the opaque texel candidate hit `c` meets on the quad from arena
+// vertex `base`: on foliage (a tinted quad: leaves, grass, vines; RT lighting's vertex colour is
+// the tint alone, white elsewhere) with chance `LEAF_PASS` (gfx/shadow_rays.rs `leaf_pass`), a
+// leaf's light let through and scattered on. A hash of the hit, which the view's jitter and the
+// rays' own directions move from frame to frame, so the denoiser averages it into the share.
+// horizon-rtx sun.rahit `leaf_pass` is the same. Not for what a mirror or a refraction shows
+// (`hw_leaves_pass` false there): the leaves seen in the water stay as drawn.
+var<private> hw_leaves_pass: bool = true;
+fn hw_leaf_pass(c: RayIntersection, base: u32) -> bool {
+    if LEAF_PASS <= 0.0 || !hw_leaves_pass { return false; }
+    let w = arena_at(base, 5u);
+    let r = w & 255u;
+    let g = (w >> 8u) & 255u;
+    let b = (w >> 16u) & 255u;
+    if max(r, max(g, b)) - min(r, min(g, b)) < 16u { return false; }
+    var h = bitcast<u32>(c.t) ^ (c.primitive_index * 0x9e3779b9u)
+        ^ (bitcast<u32>(c.barycentrics.x) * 0x85ebca6bu) ^ (bitcast<u32>(c.barycentrics.y) * 0xc2b2ae35u);
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    h ^= h >> 16u;
+    return f32(h >> 8u) < LEAF_PASS * 16777216.0;
 }
 // The wind (gfx/wind.rs): its buffer, the terrain's binding 25 here (the text between WIND-BEGIN
 // and WIND-END in terrain.wgsl is appended to this shader).
@@ -1097,7 +1122,9 @@ fn shore_calm(world: vec3<f32>) -> f32 {
 // What a mirror at camera-relative `start` reflects along `r`: the surface met, lit by the sun's
 // shadow ray and the radiance cache (or the last frame's screen) there; a 0 at the sky.
 fn hw_mirror(start: vec3<f32>, r: vec3<f32>) -> vec4<f32> {
+    hw_leaves_pass = false;
     let h = hw_hit(start, r, 512.0);
+    hw_leaves_pass = true;
     if h.t < 0.0 { return vec4(0.0); }
     let seen = start + r * h.t;
     let light = sun_on(seen + h.normal * 0.02, h.normal) + hw_seen_light(seen, h.normal);

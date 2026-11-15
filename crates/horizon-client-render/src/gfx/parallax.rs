@@ -24,7 +24,7 @@
 //! face turned away from it, as much as the specular map's blue says (65 and up) or, where it says
 //! nothing, as much as `SSS_THIN` for leaves, plants and the like (`gfx/transmission.rs`), none
 //! for thick blocks. Its colour is the pack's `_sss` map (RTX Remix's backlight tint) where the
-//! sprite has one, the albedo's twice (filtered by the leaf on the way in and out) where not.
+//! sprite has one, the albedo where not (terrain.wgsl `rt_leaf_colour`).
 //!
 //! The pipelines are vanilla's terrain (terrain.wgsl's section, prefixed as for the material
 //! stage, `native_material.rs`) with entries of their own; they read the terrain's group 0,
@@ -521,10 +521,11 @@ fn parallax_rt_lit(in: ParallaxOut, s: ParallaxSurface) -> vec3<f32> {
     let thin = (thin_layers[layer] & 1u) != 0u;
     let intensity = select(select(0.0, SSS_THIN, thin), m.subsurface, m.subsurface > 0.0);
     // The pack's tint, with the face's biome colour as a hue only (the map is as bright as the
-    // light through the leaf), or the albedo's twice.
+    // light through the leaf), or the albedo's (terrain.wgsl `rt_leaf_colour`).
     let sss = subsurface_at(layer, s.uv, s.du, s.dv);
     let hue = in.tint / max(max(in.tint.r, in.tint.g), max(in.tint.b, 1e-3));
-    let tint = select(albedo * albedo, horizon_terrain_decode_gamma(sss.rgb * hue), sss.a > 0.5);
+    let tint = select(horizon_terrain_rt_leaf_colour(albedo), horizon_terrain_decode_gamma(sss.rgb * hue),
+        sss.a > 0.5);
     m.subsurface = 0.0;
     return horizon_terrain_rt_material_lit(m, s.geo, in.position, in.clip.xy, in.light,
         in.spherical, in.cylindrical) + parallax_transmission(in, s.geo, tint, intensity);

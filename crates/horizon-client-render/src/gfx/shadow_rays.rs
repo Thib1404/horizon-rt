@@ -294,11 +294,13 @@ const SPRITE_SPLIT: u32 = {split}u;
 const GI_HW_VISIBILITY: bool = {};
              const SHARE_CHECK: bool = {};
 const GI_TURN_BITS: u32 = {}u;
+const LEAF_PASS: f32 = {:?};
 {}{hardware}{}{wind}",
             first_hit_flag(),
             !gi_dda(),
             share_check(),
             gi_turn_bits(),
+            leaf_pass(),
             include_str!("shadow_rays.wgsl"),
             lava_look()
         )
@@ -310,6 +312,23 @@ const GI_TURN_BITS: u32 = {}u;
             include_str!("shadow_rays.wgsl")
         )
     }
+}
+
+/// The share of a leaf's opaque texels a hardware ray passes (shadow_rays_hw.wgsl `hw_leaf_pass`,
+/// horizon-rtx sun.rahit the same): a leaf lets about a fifth of the light through and scatters
+/// it on, where a texel stopped it all, and a canopy of dark oak two or three blocks deep (four
+/// to six faces of leaves) let a thousandth through: under it, black. `HORIZON_RT_LEAF_PASS`
+/// (0 to 1, 0: as before), in 255ths as horizon-rtx's push constants carry it.
+pub fn leaf_pass() -> f32 {
+    static PASS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *PASS.get_or_init(|| leaf_pass_of(std::env::var("HORIZON_RT_LEAF_PASS").ok().as_deref()))
+}
+fn leaf_pass_of(value: Option<&str>) -> f32 {
+    let p = value
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| (0.0..=1.0).contains(v))
+        .unwrap_or(0.35);
+    (p * 255.0).round() / 255.0
 }
 
 /// `HORIZON_RT_FORCE_OPAQUE=1`: every hardware ray is traced with the force-opaque ray flag, so
@@ -1623,6 +1642,13 @@ fn edge_band() -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_leaf_pass_reads_its_variable_in_255ths() {
+        assert_eq!(super::leaf_pass_of(None), 89.0 / 255.0);
+        assert_eq!(super::leaf_pass_of(Some("0")), 0.0);
+        assert_eq!(super::leaf_pass_of(Some(" 1 ")), 1.0);
+        assert_eq!(super::leaf_pass_of(Some("2")), 89.0 / 255.0);
+    }
     #[test]
     fn a_radiance_cache_cell_is_nine_words() {
         // The buffer is made with nine words a cell (`CACHE_CELLS * 9`), as both shaders lay it out.

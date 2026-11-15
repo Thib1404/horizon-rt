@@ -1684,7 +1684,8 @@ fn rt_fresnel(f0: vec3<f32>, cosine: f32) -> vec3<f32> {
 }
 // Whether the forest fix `bit` is switched off (gfx/rt_switches.rs `rt_forest_bits`): 1 the sky's
 // reflection by `rt_env_brdf`, 2 the sky's light through leaves (gfx/parallax.rs
-// `parallax_transmission`).
+// `parallax_transmission`), 4 the light through leaves in their own colour once (`rt_leaf_colour`)
+// and the foliage scattering it without a pack (`rt_lit`).
 fn rt_old(bit: u32) -> bool {
     return (u32(max(globals.rt_stream.w, 0.0) + 0.5) & bit) != 0u;
 }
@@ -1694,6 +1695,13 @@ fn rt_old(bit: u32) -> bool {
 // view's cosine `nv`. Schlick's Fresnel at `nv` is a mirror's: on a rough face seen at a grazing
 // angle it reflected up to a third of the sky (f0 0.04: 0.016 here), and toward a low sun every
 // leaf and blade of grass caught the bright sky as frost.
+// The colour the light through a leaf takes, its albedo `albedo` (linear): a leaf's transmittance
+// is about its reflectance (PROSPECT's mesophyll scatters both alike), so its colour once. It was
+// its colour twice (`rt_old` 4): a dark oak's leaf (albedo near 0.06) let 0.4 % through, its
+// underside black even with the sun on its top.
+fn rt_leaf_colour(albedo: vec3<f32>) -> vec3<f32> {
+    return select(albedo, albedo * albedo, rt_old(4u));
+}
 fn rt_env_brdf(f0: vec3<f32>, roughness: f32, nv: f32) -> vec3<f32> {
     let c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
     let c1 = vec4(1.0, 0.0425, 1.04, -0.04);
@@ -1790,12 +1798,12 @@ fn rt_shade(m: RtMaterial, geo: vec3<f32>, pos: vec3<f32>, light: vec2<f32>, v: 
     let glint = sun * specular * (nl * gate);
     let glint_luminance = dot(glint, vec3(0.2126, 0.7152, 0.0722));
     let highlight = glint * min(1.0, FIREFLY_LUMINANCE / max(glint_luminance, 1e-6));
-    // Through leaves and plants: the light from behind, a third of it out the other side, filtered
-    // by the leaf on its way in and out (its colour twice: a deeper green than its face's).
-    let through = diffuse * m.albedo * m.subsurface * 0.35 * max(dot(-geo, l), 0.0)
-        * (1.0 - gate);
+    // Through leaves and plants: the light from behind, a third of it out the other side, in the
+    // leaf's colour (`rt_leaf_colour`).
+    let leaf = rt_leaf_colour(m.albedo) * ((1.0 - m.metal) * m.subsurface * 0.35);
+    let through = leaf * max(dot(-geo, l), 0.0) * (1.0 - gate);
     // And the sky's light on its far side, the same way (`rt_sky_behind`).
-    let through_sky = diffuse * m.albedo * m.subsurface * 0.35 * rt_sky_behind(geo, light.x);
+    let through_sky = leaf * rt_sky_behind(geo, light.x);
     // The sky and the light sources: traced (`traced`, the sky's light seen through rays in every
     // direction, accumulated), or past the grid from the light levels: the sky from where the face
     // sees most of it, between its normal and the zenith, as much as its sky light level says,
@@ -2870,7 +2878,12 @@ fn rt_packed_ice(m_in: RtMaterial, layer: u32) -> RtMaterial {
 // RT lighting: a fragment without maps, its albedo (`albedo`, gamma) lit and fogged, wet as the
 // rain left it.
 fn rt_lit(albedo: vec3<f32>, in: TerrainOut, n: vec3<f32>) -> vec3<f32> {
-    let m = rt_wet(rt_packed_ice(rt_plain(albedo, n), in.layer), n, in.pos, in.clip.xy,
+    var plain = rt_plain(albedo, n);
+    // Leaves, plants and vines (the wind's classes, gfx/wind.rs) scatter the light through them as
+    // much as gfx/parallax.rs `SSS_THIN` says with a pack; without one they let none through and
+    // stayed dark with the sun or the sky behind them (`rt_old` 4).
+    if !rt_old(4u) && wind_class(in.layer) != 0u { plain.subsurface = 0.7; }
+    let m = rt_wet(rt_packed_ice(plain, in.layer), n, in.pos, in.clip.xy,
         in.light.x, -1.0, 0.5);
     return rt_material_lit(m, n, in.pos, in.clip.xy, in.light, in.spherical, in.cylindrical);
 }
