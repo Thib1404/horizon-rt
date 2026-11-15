@@ -569,6 +569,13 @@ fn denoiser(
                     )),
                 ),
                 ("SKIP", f64::from(skip & DENOISE_EARLY_OUT)),
+                // `HORIZON_RT_DENOISE_PLANE=0`: the taps' distance along the rays only, as before.
+                (
+                    "DENOISE_PLANE",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_DENOISE_PLANE").as_deref() != Ok("0"),
+                    )),
+                ),
             ],
             ..Default::default()
         },
@@ -1756,6 +1763,7 @@ mod tests {
             let mut constants = naga::back::PipelineConstants::default();
             constants.insert("DEBUG".to_string(), 0.0);
             constants.insert("SHARE_GUARD".to_string(), 0.0);
+            constants.insert("DENOISE_PLANE".to_string(), 1.0);
             constants.insert(
                 "SKIP".to_string(),
                 f64::from(skip & super::DENOISE_EARLY_OUT),
