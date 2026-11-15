@@ -956,7 +956,11 @@ fn sun_on(lifted: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 }
 // The rest of the light reaching a face at camera-relative `at`: the radiance cache's, else the
 // last frame's screen (w below 0: neither).
+// `HORIZON_RT_GI_ONE_BOUNCE=1` (a diagnosis): no light but the sun's at a bounce ray's hit, so
+// the bounced light can't feed itself back through the cache or the last frame.
+override GI_ONE_BOUNCE: bool = false;
 fn cached_on(at: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
+    if GI_ONE_BOUNCE { return vec4(0.0, 0.0, 0.0, 1.0); }
     let cached = cache_light(at, n);
     if cached.a >= 0.0 { return cached; }
     return last_light(at);

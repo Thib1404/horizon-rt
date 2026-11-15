@@ -425,6 +425,10 @@ impl SunPass {
             if std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() == Ok("reject") {
                 pass.flags |= 1 << 17;
             }
+            // Bit 18: no light but the sun's at a bounce's hit (`HORIZON_RT_GI_ONE_BOUNCE=1`).
+            if std::env::var("HORIZON_RT_GI_ONE_BOUNCE").as_deref() == Ok("1") {
+                pass.flags |= 1 << 18;
+            }
             log::info!(
                 "Horizon RTX: a ray tracing pipeline for {}{}{}, shader execution reordering {}",
                 if kinds.sun { "the sun pass" } else { "" },

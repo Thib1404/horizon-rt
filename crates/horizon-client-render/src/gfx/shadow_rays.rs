@@ -514,6 +514,12 @@ fn kernel(
                     )),
                 ),
                 (
+                    "GI_ONE_BOUNCE",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_GI_ONE_BOUNCE").as_deref() == Ok("1"),
+                    )),
+                ),
+                (
                     "GI_NEIGHBOUR_REJECT",
                     f64::from(u8::from(
                         std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() == Ok("reject"),
