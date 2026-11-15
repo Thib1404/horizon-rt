@@ -421,6 +421,10 @@ impl SunPass {
             if !gi_neighbour_rays() {
                 pass.flags |= 1 << 16;
             }
+            // Bit 17: every neighbour's sample taken as unseen (`=reject`, a diagnosis).
+            if std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() == Ok("reject") {
+                pass.flags |= 1 << 17;
+            }
             log::info!(
                 "Horizon RTX: a ray tracing pipeline for {}{}{}, shader execution reordering {}",
                 if kinds.sun { "the sun pass" } else { "" },
@@ -1147,6 +1151,7 @@ fn gi_reuse() -> u32 {
     match std::env::var("HORIZON_RT_GI_REUSE").as_deref() {
         Ok("temporal") => 1,
         Ok("none") => 2,
+        Ok("spatial") => 3,
         _ => 0,
     }
 }

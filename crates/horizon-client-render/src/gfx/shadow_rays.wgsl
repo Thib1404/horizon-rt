@@ -1131,7 +1131,8 @@ fn last_gi(at: vec2<i32>) -> GiReservoir {
 override GI_HISTORY: f32 = 20.0;
 // Which reservoirs ReSTIR GI merges (`HORIZON_RT_GI_REUSE`, to tell what each adds): 0 the last
 // frame's and two neighbours', 1 the last frame's alone (`temporal`), 2 none (`none`: each frame's
-// own ray, unbiased, the light every other way should average to).
+// own ray, unbiased, the light every other way should average to), 3 the neighbours' alone
+// (`spatial`).
 override GI_REUSE: u32 = 0u;
 // `HORIZON_RT_SKIP`'s bit for the neighbours' samples taken as if seen from this pixel's own point
 // (their Jacobian 1), as before: a sample a neighbour found right beside it (a wall's foot, a
@@ -1173,8 +1174,10 @@ fn gi_sees(pos: vec3<f32>, at: vec3<f32>) -> bool {
     return ray(pos, to / d, SKY_BUDGET, reach) >= 0.5;
 }
 // `HORIZON_RT_GI_NEIGHBOUR_RAYS=0`: the neighbours' samples merged unseen and only the chosen one
-// checked, as before (`restir_gi`).
+// checked, as before (`restir_gi`); `reject` (a diagnosis): every neighbour's sample taken as
+// unseen, so the light must match `GI_REUSE` 1's if the rays run.
 override GI_NEIGHBOUR_RAYS: bool = true;
+override GI_NEIGHBOUR_REJECT: bool = false;
 fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>, has_last: bool)
     -> vec4<f32> {
     // The bounce pass's reservoir where it made one: the light it stands for, as below.
@@ -1207,7 +1210,7 @@ fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>,
         for (var j = 0; j < 3; j++) {
             let jitter = random2(texel, 80u + u32(j));
             let off = select(vec2<i32>((jitter * 2.0 - 1.0) * 8.0), vec2(0), j == 0);
-            if GI_REUSE == 2u || (GI_REUSE == 1u && j > 0) { continue; }
+            if GI_REUSE == 2u || (GI_REUSE == 1u && j > 0) || (GI_REUSE == 3u && j == 0) { continue; }
             let q = last_gi(last_at + off);
             if q.seen <= 0.0 || q.weight <= 0.0 { continue; }
             // The same surface: the face it showed and its distance (a floor's pixel doesn't take
@@ -1239,7 +1242,9 @@ fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>,
             // reservoir hold more light than the pixel gets, and the last frame's reservoir,
             // merged again each frame, built it up (a lit room 2.7 times too bright, in blotches
             // and streaks). The last frame's own sample was seen from this point already.
-            if j > 0 && GI_NEIGHBOUR_RAYS && !gi_sees(pos, q.s.at) { continue; }
+            if j > 0 && GI_NEIGHBOUR_RAYS && (!gi_sees(pos, q.s.at) || GI_NEIGHBOUR_REJECT) {
+                continue;
+            }
             let p = gi_target(q.s, pos, n);
             // The neighbours' history counts for less than the pixel's own (no blotches of one
             // sample spread over a patch).

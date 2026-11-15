@@ -83,7 +83,8 @@ layout(set = 0, binding = 24) readonly buffer Cache { uint w[]; } cache;
 // the kernel's `SKIP` 16 (the bounced light never rests); bit 5: its `SKIP_GI_JACOBIAN` (the
 // neighbours' samples with a Jacobian of 1, as before); bit 6: its `SKIP_NORMAL_NEAREST` (a
 // pixel's normal from its nearer neighbours, as before); bits 7 and 8: its `GI_REUSE`; bits 9
-// to 15: its `GI_HISTORY` (0 for 20); bit 16: its `GI_NEIGHBOUR_RAYS` off (as before).
+// to 15: its `GI_HISTORY` (0 for 20); bit 16: its `GI_NEIGHBOUR_RAYS` off (as before), bit 17
+// its `GI_NEIGHBOUR_REJECT`.
 layout(push_constant) uniform Push { uint sprite_split; uint flags; } push;
 
 // sun.rahit sets it below 0 when a ray met a translucent quad (and let it through).
@@ -568,7 +569,7 @@ void main() {
                 if (has_last) {
                     for (int j = 0; j < 3; j++) {
                         uint reuse = (push.flags >> 7u) & 3u;
-                        if (reuse == 2u || (reuse == 1u && j > 0)) continue;
+                        if (reuse == 2u || (reuse == 1u && j > 0) || (reuse == 3u && j == 0)) continue;
                         vec2 jitter = random2(texel, 80u + uint(j));
                         ivec2 off = j == 0 ? ivec2(0) : ivec2((jitter * 2.0 - 1.0) * 8.0);
                         float q_weight, q_seen;
@@ -592,7 +593,7 @@ void main() {
                         }
                         // The kernel's: a neighbour's sample this pixel doesn't see is left out.
                         bool neighbour_rays = (push.flags & 65536u) == 0u;
-                        if (j > 0 && neighbour_rays && !gi_sees(from, q.at)) continue;
+                        if (j > 0 && neighbour_rays && (!gi_sees(from, q.at) || (push.flags & 131072u) != 0u)) continue;
                         float pt = gi_target(q, from, n);
                         float m = min(q_seen, j == 0 ? gi_history() : gi_history() / 4.0);
                         float w = pt * q_weight * m * jacobian;

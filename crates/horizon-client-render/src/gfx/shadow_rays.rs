@@ -513,6 +513,12 @@ fn kernel(
                         std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() != Ok("0"),
                     )),
                 ),
+                (
+                    "GI_NEIGHBOUR_REJECT",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() == Ok("reject"),
+                    )),
+                ),
             ],
             ..Default::default()
         },
@@ -1630,12 +1636,14 @@ fn edge_band() -> f64 {
 }
 
 /// Which reservoirs ReSTIR GI merges (shadow_rays.wgsl `GI_REUSE`): `HORIZON_RT_GI_REUSE=temporal`
-/// the last frame's alone, `none` none (each frame's own ray, the unbiased reference); otherwise
+/// the last frame's alone, `none` none (each frame's own ray, the unbiased reference), `spatial`
+/// the neighbours' alone; otherwise
 /// the last frame's and two neighbours'.
 fn gi_reuse() -> f64 {
     match std::env::var("HORIZON_RT_GI_REUSE").as_deref() {
         Ok("temporal") => 1.0,
         Ok("none") => 2.0,
+        Ok("spatial") => 3.0,
         _ => 0.0,
     }
 }
