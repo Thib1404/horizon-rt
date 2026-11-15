@@ -509,6 +509,12 @@ fn kernel(
                 ("GI_HISTORY", gi_history()),
                 ("GI_BOUNCE", f64::from(gi_bounce())),
                 (
+                    "REST_MOMENT",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_REST_MOMENT").as_deref() != Ok("0"),
+                    )),
+                ),
+                (
                     "REPROJECT_CENTRE",
                     f64::from(u8::from(
                         std::env::var("HORIZON_RT_REPROJECT_CENTRE").as_deref() != Ok("0"),

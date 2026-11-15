@@ -398,6 +398,13 @@ var<private> fast_out: vec4<f32>;
 // Whether this frame's `trace` kept the last frame's sky (the bounced light's turns), so the fast
 // history's sky seen isn't fed the slow history's own value back.
 var<private> sky_rested: bool = false;
+// The frames between this surface's bounce rays (`trace`'s turns): 1 where it traces every frame.
+var<private> sky_turns: f32 = 1.0;
+// `HORIZON_RT_REST_MOMENT=0`: the light's second moment (the denoiser's variance) takes every
+// frame's, as before. By default a frame that kept the last frame's bounced light adds none (the
+// light it kept is the history's own, which hid the bounces' noise from the denoiser: the light
+// was found steady and left unfiltered, mottled), and a traced frame counts for its turns' frames.
+override REST_MOMENT: bool = true;
 // RT lighting's primary surface replacement on water (Remix's PSR, shadow_rays_hw.wgsl
 // `hw_reflect`): the light of what the water at the pixel reflects (rgb), a 1 a surface, 0 the
 // sky or no water (the water's shader then reflects its own sky).
@@ -2070,7 +2077,9 @@ fn trace(p: vec2<i32>, texel: vec2<i32>) -> Traced {
         // seen, or past the grid's band, rests in turns as before (each frame's GI is most of
         // the kernel's cost).
         let cut = antilag_in(textureLoad(last_direct, back.xy, 0).a);
-        rest = rest && back.z == 1 && !cut && (SKIP & 16u) == 0u;
+        let turns = back.z == 1 && !cut && (SKIP & 16u) == 0u;
+        sky_turns = select(1.0, select(f32(1u << GI_TURN_BITS), 8.0, behind_psr), turns);
+        rest = rest && turns;
         sky_rested = rest;
         if rest {
             sky = vec4(textureLoad(last_blocks, back.xy, 0).rgb, textureLoad(last_mask, back.xy, 0).b);
@@ -2391,8 +2400,14 @@ fn accumulate(texel: vec2<i32>, traced: Traced) -> Traced {
     return Traced(vec4(rays, v.rays.a),
         vec4(mix(slow_blocks, v.blocks.rgb, k), v.blocks.a),
         vec4(mix(slow_direct, v.direct.rgb, k), face + 8.0 * (n + select(0.0, 32.0, flag))),
-        vec4(sun_now.rgb, mix(slow_sun.a, v.sun.a, k)),
+        vec4(sun_now.rgb, mix(slow_sun.a, v.sun.a, moment_weight(k))),
         v.reservoir);
+}
+// The weight of this frame's second moment in the history (`REST_MOMENT`), `k` this frame's.
+fn moment_weight(k: f32) -> f32 {
+    if !REST_MOMENT { return k; }
+    if sky_rested { return 0.0; }
+    return min(k * sky_turns, 1.0);
 }
 // VR's second eye: the first eye's depth (its layer of the prepass both eyes share) and masks of
 // this frame (gfx/shadow_rays.rs `run`): its light once accumulated over its frames (not yet
