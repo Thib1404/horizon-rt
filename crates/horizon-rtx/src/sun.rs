@@ -437,6 +437,11 @@ impl SunPass {
             // Bits 20-21: the light at a bounce's hit besides the sun's (`HORIZON_RT_GI_BOUNCE`:
             // 1 `cache` only, 2 `screen` only, 3 `traced`, neither).
             pass.flags |= gi_bounce() << 20;
+            // Bit 22: the last frame's masks read at their texels' centres, as before
+            // (`HORIZON_RT_REPROJECT_CENTRE=0`; the kernel's `mask_texel_of`).
+            if std::env::var("HORIZON_RT_REPROJECT_CENTRE").as_deref() == Ok("0") {
+                pass.flags |= 1 << 22;
+            }
             log::info!(
                 "Horizon RTX: a ray tracing pipeline for {}{}{}, shader execution reordering {}",
                 if kinds.sun { "the sun pass" } else { "" },

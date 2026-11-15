@@ -311,6 +311,16 @@ vec4 cache_light(vec3 pos, vec3 n) {
     }
     return vec4(0.0, 0.0, 0.0, -1.0);
 }
+// The kernel's `mask_texel_of`: the last mask's texel at mask coordinates `at`, its light found at
+// `pixel_of`'s pixel centre (flag bit 22: at the texel's centre, as before).
+ivec2 mask_texel_of(vec2 at) {
+    float offset = 0.5;
+    if ((push.flags & 4194304u) == 0u) {
+        int scale = int(rt.size.z);
+        offset = (float(scale / 2) + 0.5) / float(scale);
+    }
+    return ivec2(floor(at - offset + 0.5));
+}
 // The kernel's `last_light`: the last frame's light other than the sun's where it showed `at`.
 vec4 last_light(vec3 at) {
     if (rt.motion.w < 0.5) return vec4(0.0, 0.0, 0.0, -1.0);
@@ -320,7 +330,7 @@ vec4 last_light(vec3 at) {
     vec2 ndc = c.xy / c.w;
     if (any(greaterThan(abs(ndc), vec2(1.0)))) return vec4(0.0, 0.0, 0.0, -1.0);
     vec2 size = vec2(textureSize(last_mask, 0));
-    ivec2 texel = clamp(ivec2(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y)),
+    ivec2 texel = clamp(mask_texel_of(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y)),
         ivec2(0), ivec2(size) - 1);
     float d = length(q);
     float shown = texelFetch(last_mask, texel, 0).a;
@@ -352,7 +362,7 @@ ivec3 restir_last(vec3 pos) {
     vec2 ndc = c.xy / c.w;
     if (any(greaterThan(abs(ndc), vec2(1.0)))) return ivec3(0);
     vec2 size = vec2(textureSize(last_mask, 0));
-    ivec2 at = ivec2(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y));
+    ivec2 at = mask_texel_of(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y));
     vec4 last = texelFetch(last_mask, clamp(at, ivec2(0), ivec2(size) - 1), 0);
     float d = length(q);
     if (last.a < 0.0 || abs(last.a - d) > 0.05 + 0.02 * d) return ivec3(at, 0);

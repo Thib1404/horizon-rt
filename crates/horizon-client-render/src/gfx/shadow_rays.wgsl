@@ -1041,7 +1041,7 @@ fn last_light(at: vec3<f32>) -> vec4<f32> {
     let ndc = c.xy / c.w;
     if any(abs(ndc) > vec2(1.0)) { return vec4(0.0, 0.0, 0.0, -1.0); }
     let size = vec2<f32>(textureDimensions(last_mask));
-    let texel = clamp(vec2<i32>(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y)),
+    let texel = clamp(mask_texel_of(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y)),
         vec2(0), vec2<i32>(size) - 1);
     let d = length(q);
     let shown = textureLoad(last_mask, texel, 0).a;
@@ -2110,6 +2110,24 @@ fn tile_of(t: vec2<u32>, bits: u32) -> u32 {
     return k & ((1u << bits) - 1u);
 }
 // Where camera-relative `pos` was in the last frame's masks (xy), and z 1 when it showed it there.
+// Where in its mask texel the light a texel holds was found, in texels: a texel's surface is
+// `pixel_of`'s pixel, whose centre is half a pixel past the texel's centre when a texel spans an
+// even number of pixels (0.75 at 2x2). Read back as if at the centre (0.5), the last frame's light
+// came from a quarter texel right and down: the history's bilinear read took a quarter of the
+// texel there each frame, the frames resting between bounces (`trace`'s turns) without new light
+// to mend it, and the bounced light crept up and left, in diagonal streaks from every bright edge
+// (a doorway's lintel, a red wall's corner) until the turns' rays caught up. `HORIZON_RT_
+// REPROJECT_CENTRE=0` reads it at the centre, as before.
+override REPROJECT_CENTRE: bool = true;
+fn mask_sample_offset() -> f32 {
+    if !REPROJECT_CENTRE { return 0.5; }
+    let scale = i32(rt.size.z);
+    return (f32(scale / 2) + 0.5) / f32(scale);
+}
+// The last mask's texel holding camera-relative `q` once projected to its mask coordinates `at`.
+fn mask_texel_of(at: vec2<f32>) -> vec2<i32> {
+    return vec2<i32>(floor(at - mask_sample_offset() + 0.5));
+}
 fn restir_last(pos: vec3<f32>) -> vec3<i32> {
     if rt.motion.w < 0.5 { return vec3(0); }
     let q = pos + rt.motion.xyz;
@@ -2118,7 +2136,7 @@ fn restir_last(pos: vec3<f32>) -> vec3<i32> {
     let ndc = c.xy / c.w;
     if any(abs(ndc) > vec2(1.0)) { return vec3(0); }
     let size = vec2<f32>(textureDimensions(last_mask));
-    let at = vec2<i32>(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y));
+    let at = mask_texel_of(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y));
     let last = textureLoad(last_mask, clamp(at, vec2(0), vec2<i32>(size) - 1), 0);
     let d = length(q);
     if last.a < 0.0 || abs(last.a - d) > 0.05 + 0.02 * d { return vec3(at, 0); }
@@ -2242,7 +2260,7 @@ fn accumulate(texel: vec2<i32>, traced: Traced) -> Traced {
     let ndc = c.xy / c.w;
     if any(abs(ndc) > vec2(1.0)) { return v; }
     let size = vec2<f32>(textureDimensions(last_mask));
-    let at = vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y) - 0.5;
+    let at = vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y) - mask_sample_offset();
     let base = vec2<i32>(floor(at));
     let f = at - floor(at);
     let d = length(q);
