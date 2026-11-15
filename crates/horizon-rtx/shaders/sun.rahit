@@ -106,28 +106,6 @@ vec4 hw_texel(uint base) {
     return texelFetch(sprites, ivec3(texel, int(layer)), 0);
 }
 
-// Whether the ray goes on through the opaque texel it met on the quad from arena vertex `base`:
-// on foliage (a tinted quad) with the chance `push.flags` bits 8 to 15 give in 255ths, a leaf's
-// light let through (horizon-client-render gfx/shadow_rays_hw.wgsl `hw_leaf_pass`, the same
-// rule and hash).
-bool leaf_pass(uint base) {
-    float pass = float((push.flags >> 8u) & 255u) / 255.0;
-    if (pass <= 0.0) return false;
-    uint w = arena_at(base, 5u);
-    uint r = w & 255u;
-    uint g = (w >> 8u) & 255u;
-    uint b = (w >> 16u) & 255u;
-    if (max(r, max(g, b)) - min(r, min(g, b)) < 16u) return false;
-    uint h = floatBitsToUint(gl_HitTEXT) ^ (uint(gl_PrimitiveID) * 0x9e3779b9u)
-        ^ (floatBitsToUint(bary.x) * 0x85ebca6bu) ^ (floatBitsToUint(bary.y) * 0xc2b2ae35u);
-    h ^= h >> 16u;
-    h *= 0x7feb352du;
-    h ^= h >> 15u;
-    h *= 0x846ca68bu;
-    h ^= h >> 16u;
-    return float(h >> 8u) < pass * 16777216.0;
-}
-
 void main() {
     uvec4 at = row_at(0u);
     if (uint(gl_GeometryIndexEXT) == at.w) {
@@ -151,5 +129,4 @@ void main() {
     if ((push.flags & 2u) != 0u && gl_HitTEXT < 0.1) ignoreIntersectionEXT;
     vec4 texel = hw_texel(base);
     if (!(texel.a < 0.0 || texel.a >= 0.5)) ignoreIntersectionEXT;
-    if (texel.a >= 0.0 && leaf_pass(base)) ignoreIntersectionEXT;
 }

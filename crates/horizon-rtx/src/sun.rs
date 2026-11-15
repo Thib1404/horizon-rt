@@ -96,8 +96,7 @@ pub struct SunPass {
     /// Which ray generations run.
     kinds: Kinds,
     /// The push constants' flags (bit 0: reorder, bit 1: the wind, bits 2 and 3: the bounced
-    /// light's turns as the kernel's `GI_TURN_BITS`, bit 4: the kernel's `SKIP` 16, no resting;
-    /// bits 8 to 15 `leaf_pass_255`).
+    /// light's turns as the kernel's `GI_TURN_BITS`, bit 4: the kernel's `SKIP` 16, no resting).
     flags: u32,
     /// The outputs, a texel a ray, the mask's size: the sun's light through (`Rgba16Float`), the
     /// bounce pass's hit and what it is (`Rgba32Float`) and its face, colour and sun light
@@ -407,8 +406,6 @@ impl SunPass {
             pass.flags = u32::from(reorder()) | if wind_skipped() { 0 } else { 2 };
             // Bits 2 and 3, bit 4: gi.rgen rests its tiles on the kernel's own turns.
             pass.flags |= gi_turn_bits() << 2 | if skipped(16) { 16 } else { 0 };
-            // Bits 8 to 15: the share of a leaf's opaque texels the rays pass, in 255ths.
-            pass.flags |= leaf_pass_255() << 8;
             log::info!(
                 "Horizon RTX: a ray tracing pipeline for {}{}{}, shader execution reordering {}",
                 if kinds.sun { "the sun pass" } else { "" },
@@ -1119,20 +1116,6 @@ pub const ROW: u64 = INSTANCE_SIZE;
 /// Whether `HORIZON_RT_SKIP` has the wind's bit (4096, horizon-client gfx/wind.rs).
 fn wind_skipped() -> bool {
     skipped(4096)
-}
-
-/// The share of a leaf's opaque texels sun.rahit lets the rays through, in 255ths:
-/// `HORIZON_RT_LEAF_PASS` (0 to 1, 0 none as before), 0.35 by default (horizon-client-render
-/// gfx/shadow_rays.rs `leaf_pass`, the same rule).
-fn leaf_pass_255() -> u32 {
-    leaf_pass_of(std::env::var("HORIZON_RT_LEAF_PASS").ok().as_deref())
-}
-fn leaf_pass_of(value: Option<&str>) -> u32 {
-    let p = value
-        .and_then(|v| v.trim().parse::<f32>().ok())
-        .filter(|v| (0.0..=1.0).contains(v))
-        .unwrap_or(0.35);
-    (p * 255.0).round() as u32
 }
 
 /// Whether `HORIZON_RT_SKIP` has `bit` (the kernel's `SKIP`, as the game starts with it).
