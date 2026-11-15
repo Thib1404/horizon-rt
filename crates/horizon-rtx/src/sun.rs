@@ -429,6 +429,11 @@ impl SunPass {
             if std::env::var("HORIZON_RT_GI_ONE_BOUNCE").as_deref() == Ok("1") {
                 pass.flags |= 1 << 18;
             }
+            // Bit 19: the neighbours merged here too and fed back to the next frame, as before
+            // (`HORIZON_RT_GI_SPATIAL_FEEDBACK=1`); clear, the kernel merges them for this frame.
+            if std::env::var("HORIZON_RT_GI_SPATIAL_FEEDBACK").as_deref() == Ok("1") {
+                pass.flags |= 1 << 19;
+            }
             log::info!(
                 "Horizon RTX: a ray tracing pipeline for {}{}{}, shader execution reordering {}",
                 if kinds.sun { "the sun pass" } else { "" },

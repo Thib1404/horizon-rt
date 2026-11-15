@@ -1182,36 +1182,71 @@ fn gi_sees(pos: vec3<f32>, at: vec3<f32>) -> bool {
 // unseen, so the light must match `GI_REUSE` 1's if the rays run.
 override GI_NEIGHBOUR_RAYS: bool = true;
 override GI_NEIGHBOUR_REJECT: bool = false;
+// `HORIZON_RT_GI_SPATIAL_FEEDBACK=1`: the reservoir with the neighbours' samples merged is the one
+// the next frame takes over, as before (`restir_gi`).
+override GI_SPATIAL_FEEDBACK: bool = false;
 fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>, has_last: bool)
     -> vec4<f32> {
-    // The bounce pass's reservoir where it made one: the light it stands for, as below.
+    // The bounce pass's reservoir where it made one: with `GI_SPATIAL_FEEDBACK` the whole merge
+    // and the light it stands for, as below; without it the pixel's own sample merged with the
+    // last frame's reservoir only (the one the next frame takes over), the neighbours merged
+    // here for this frame's light.
+    var from_pass = false;
+    var pass_sky = 0.0;
+    var own = GiSample(vec3(0.0), vec3(0.0), vec3(0.0));
+    var chosen = own;
+    var aim = 0.0;
+    var sum = 0.0;
+    var seen = 1.0;
     if HW && pass_ran(2u) && sun_from_pass {
         let b = textureLoad(gi_pass_b, texel, 0);
         if b.w != 0u {
             let a = textureLoad(gi_pass_a, texel, 0);
-            gi_out_a = a;
-            gi_out_b = vec4(b.xyz, 0u);
             let rg = unpack2x16float(b.x);
             let bm = unpack2x16float(b.y);
-            let cosine = max(dot(n, normalize(a.xyz - pos)), 0.0);
-            return vec4(vec3(rg, bm.x) * cosine * a.w / 3.14159265, select(0.0, 1.0, b.w == 2u));
+            pass_sky = select(0.0, 1.0, b.w == 2u);
+            if GI_SPATIAL_FEEDBACK {
+                gi_out_a = a;
+                gi_out_b = vec4(b.xyz, 0u);
+                let cosine = max(dot(n, normalize(a.xyz - pos)), 0.0);
+                return vec4(vec3(rg, bm.x) * cosine * a.w / 3.14159265, pass_sky);
+            }
+            from_pass = true;
+            own = GiSample(a.xyz, unpack4x8snorm(b.z).xyz, vec3(rg, bm.x));
+            chosen = own;
+            aim = gi_target(own, pos, n);
+            seen = bm.y;
+            sum = a.w * seen * aim;
         }
     }
-    let own = gi_sample(pos, n, texel);
-    // The new candidate, drawn by the cosine: its weight its aim over that chance (pi cancels
-    // the cosine, Lambert's 1/pi is in the light's units).
-    var chosen = own;
-    var aim = gi_target(own, pos, n);
-    var sum = luminance(own.light) * 3.14159265;
-    var seen = 1.0;
+    if !from_pass {
+        own = gi_sample(pos, n, texel);
+        // The new candidate, drawn by the cosine: its weight its aim over that chance (pi
+        // cancels the cosine, Lambert's 1/pi is in the light's units).
+        chosen = own;
+        aim = gi_target(own, pos, n);
+        sum = luminance(own.light) * 3.14159265;
+    }
     var reused = false;
     // Whether the chosen sample's visibility is known (a neighbour's, checked as it was merged).
     var checked = false;
     // White (`random2`), not `blue2`: which candidate the reservoir keeps and which neighbours it
     // merges must not correlate with the neighbours' own choices (whose samples it takes).
     var u = random2(texel, 70u);
+    // The reservoir the next frame takes over (`GI_SPATIAL_FEEDBACK` off): the pixel's own sample
+    // and the last frame's alone, as the reservoir stood before the neighbours were merged.
+    var kept = chosen;
+    var kept_aim = aim;
+    var kept_sum = sum;
+    var kept_seen = seen;
     if has_last {
-        for (var j = 0; j < 3; j++) {
+        for (var j = select(0, 1, from_pass); j < 3; j++) {
+            if j == 1 {
+                kept = chosen;
+                kept_aim = aim;
+                kept_sum = sum;
+                kept_seen = seen;
+            }
             let jitter = random2(texel, 80u + u32(j));
             let off = select(vec2<i32>((jitter * 2.0 - 1.0) * 8.0), vec2(0), j == 0);
             if GI_REUSE == 2u || (GI_REUSE == 1u && j > 0) || (GI_REUSE == 3u && j == 0) { continue; }
@@ -1271,23 +1306,46 @@ fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>,
     // a neighbour's was checked above unless `GI_NEIGHBOUR_RAYS` is off).
     if reused && !checked && aim > 0.0 {
         let visible = gi_sees(pos, chosen.at);
-        if !visible {
+        if !visible && from_pass {
+            // The pass's reservoir, as it stood before the neighbours.
+            chosen = kept;
+            aim = kept_aim;
+            weight = select(0.0, kept_sum / (kept_seen * kept_aim), kept_aim > 0.0);
+            seen = kept_seen;
+        } else if !visible {
             chosen = own;
             aim = gi_target(own, pos, n);
             weight = select(0.0, 3.14159265 * luminance(own.light) / aim, aim > 0.0);
             seen = 1.0;
         }
     }
+    // What the next frame takes over: with the neighbours' samples in it, as before
+    // (`HORIZON_RT_GI_SPATIAL_FEEDBACK=1`), or the reservoir before they were merged (ReSTIR GI's
+    // temporal reservoir, Ouyang et al.: the neighbours shade this frame only). Fed back each
+    // frame, the neighbours' merge and the last frame's, together with the bounced light that
+    // the cache and the last frame give a bounce ray's hit, lit a closed room ever brighter:
+    // in a controlled room on the 4090, several times the light of either reuse alone, which
+    // both matched the unreused light; one bounce alone matched too.
+    var stored = chosen;
+    var stored_weight = weight;
+    var stored_seen = seen;
+    if !GI_SPATIAL_FEEDBACK {
+        stored = kept;
+        stored_weight = select(0.0, kept_sum / (kept_seen * kept_aim), kept_aim > 0.0);
+        stored_seen = kept_seen;
+    }
     // Half floats past 65504 are infinite: the sample's light kept within them.
     chosen.light = min(finite3(chosen.light), vec3(60000.0));
     weight = min(finite(weight), 1e6);
-    gi_out_a = finite4(vec4(chosen.at, weight));
-    gi_out_b = vec4(pack2x16float(chosen.light.rg), pack2x16float(vec2(chosen.light.b, seen)),
-        pack4x8snorm(vec4(chosen.normal, 0.0)), 0u);
+    stored.light = min(finite3(stored.light), vec3(60000.0));
+    stored_weight = min(finite(stored_weight), 1e6);
+    gi_out_a = finite4(vec4(stored.at, stored_weight));
+    gi_out_b = vec4(pack2x16float(stored.light.rg), pack2x16float(vec2(stored.light.b, stored_seen)),
+        pack4x8snorm(vec4(stored.normal, 0.0)), 0u);
     let cosine = max(dot(n, normalize(chosen.at - pos)), 0.0);
     // The light the chosen sample stands for, in the diffuse light's units (Lambert's 1/pi).
     let light = chosen.light * cosine * weight / 3.14159265;
-    let sky = select(0.0, 1.0, length(own.at - pos) > 4000.0);
+    let sky = select(select(0.0, 1.0, length(own.at - pos) > 4000.0), pass_sky, from_pass);
     return vec4(light, sky);
 }
 // RT lighting's light sources: the light those of the cell holding camera-relative `pos` (on a face

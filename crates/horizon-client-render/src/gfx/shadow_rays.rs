@@ -514,6 +514,12 @@ fn kernel(
                     )),
                 ),
                 (
+                    "GI_SPATIAL_FEEDBACK",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_GI_SPATIAL_FEEDBACK").as_deref() == Ok("1"),
+                    )),
+                ),
+                (
                     "GI_ONE_BOUNCE",
                     f64::from(u8::from(
                         std::env::var("HORIZON_RT_GI_ONE_BOUNCE").as_deref() == Ok("1"),
