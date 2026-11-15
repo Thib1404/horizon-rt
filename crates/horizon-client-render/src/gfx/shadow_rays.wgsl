@@ -1126,7 +1126,13 @@ fn last_gi(at: vec2<i32>) -> GiReservoir {
     let s = GiSample(a.xyz - rt.motion.xyz, normal, vec3(rg, bm.x));
     return GiReservoir(s, a.w, bm.y);
 }
-const GI_HISTORY: f32 = 20.0;
+// The candidates a reservoir carries over at most (`HORIZON_RT_GI_HISTORY`, 1 to 100; 20
+// without it), the neighbours' a quarter of it.
+override GI_HISTORY: f32 = 20.0;
+// Which reservoirs ReSTIR GI merges (`HORIZON_RT_GI_REUSE`, to tell what each adds): 0 the last
+// frame's and two neighbours', 1 the last frame's alone (`temporal`), 2 none (`none`: each frame's
+// own ray, unbiased, the light every other way should average to).
+override GI_REUSE: u32 = 0u;
 // `HORIZON_RT_SKIP`'s bit for the neighbours' samples taken as if seen from this pixel's own point
 // (their Jacobian 1), as before: a sample a neighbour found right beside it (a wall's foot, a
 // corner) then counted as much of this pixel's view as of the neighbour's, its light smeared in
@@ -1184,6 +1190,7 @@ fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>,
         for (var j = 0; j < 3; j++) {
             let jitter = random2(texel, 80u + u32(j));
             let off = select(vec2<i32>((jitter * 2.0 - 1.0) * 8.0), vec2(0), j == 0);
+            if GI_REUSE == 2u || (GI_REUSE == 1u && j > 0) { continue; }
             let q = last_gi(last_at + off);
             if q.seen <= 0.0 || q.weight <= 0.0 { continue; }
             // The same surface: the face it showed and its distance (a floor's pixel doesn't take

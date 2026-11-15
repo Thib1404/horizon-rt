@@ -413,6 +413,9 @@ impl SunPass {
             // Bit 6: a pixel's normal from its nearer neighbours, as before (HORIZON_RT_SKIP bit
             // 67108864, the kernel's `SKIP_NORMAL_NEAREST`), in both ray generations.
             pass.flags |= if skipped(67_108_864) { 64 } else { 0 };
+            // Bits 7 to 15: which reservoirs ReSTIR GI merges and how many candidates it keeps
+            // (the kernel's `GI_REUSE` and `GI_HISTORY`).
+            pass.flags |= gi_reuse() << 7 | gi_history() << 9;
             log::info!(
                 "Horizon RTX: a ray tracing pipeline for {}{}{}, shader execution reordering {}",
                 if kinds.sun { "the sun pass" } else { "" },
@@ -1131,6 +1134,26 @@ fn skipped(bit: u32) -> bool {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .is_some_and(|s| s & bit != 0)
+}
+
+/// Which reservoirs ReSTIR GI merges (horizon-client-render gfx/shadow_rays.rs `gi_reuse`, the
+/// same rule): `HORIZON_RT_GI_REUSE=temporal` the last frame's alone (1), `none` none (2).
+fn gi_reuse() -> u32 {
+    match std::env::var("HORIZON_RT_GI_REUSE").as_deref() {
+        Ok("temporal") => 1,
+        Ok("none") => 2,
+        _ => 0,
+    }
+}
+
+/// The candidates a GI reservoir keeps at most (`HORIZON_RT_GI_HISTORY`, 1 to 100), 0 for the
+/// default 20.
+fn gi_history() -> u32 {
+    std::env::var("HORIZON_RT_GI_HISTORY")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| (1..=100).contains(v))
+        .unwrap_or(0)
 }
 
 /// The bounced light's turns as the trace kernel takes them (horizon-client-render

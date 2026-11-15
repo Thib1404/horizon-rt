@@ -82,7 +82,8 @@ layout(set = 0, binding = 24) readonly buffer Cache { uint w[]; } cache;
 // to time what the reordering gives); bits 2 and 3: the kernel's `GI_TURN_BITS` (2 or 3); bit 4:
 // the kernel's `SKIP` 16 (the bounced light never rests); bit 5: its `SKIP_GI_JACOBIAN` (the
 // neighbours' samples with a Jacobian of 1, as before); bit 6: its `SKIP_NORMAL_NEAREST` (a
-// pixel's normal from its nearer neighbours, as before).
+// pixel's normal from its nearer neighbours, as before); bits 7 and 8: its `GI_REUSE`; bits 9
+// to 15: its `GI_HISTORY` (0 for 20).
 layout(push_constant) uniform Push { uint sprite_split; uint flags; } push;
 
 // sun.rahit sets it below 0 when a ray met a translucent quad (and let it through).
@@ -480,7 +481,11 @@ GiSample last_gi(ivec2 at, out float weight, out float seen) {
     seen = bm.y;
     return GiSample(a.xyz - rt.motion.xyz, normal, vec3(rg, bm.x));
 }
-const float GI_HISTORY = 20.0;
+// The kernel's `GI_HISTORY` (flag bits 9 to 15, 0 for 20) and `GI_REUSE` (bits 7 and 8).
+float gi_history() {
+    uint h = (push.flags >> 9u) & 127u;
+    return h == 0u ? 20.0 : float(h);
+}
 // The kernel's `GI_JACOBIAN_MAX` and `gi_jacobian`.
 const float GI_JACOBIAN_MAX = 10.0;
 float gi_jacobian(GiSample s, vec3 from, vec3 to) {
@@ -553,6 +558,8 @@ void main() {
                 vec2 u = random2(texel, 70u);
                 if (has_last) {
                     for (int j = 0; j < 3; j++) {
+                        uint reuse = (push.flags >> 7u) & 3u;
+                        if (reuse == 2u || (reuse == 1u && j > 0)) continue;
                         vec2 jitter = random2(texel, 80u + uint(j));
                         ivec2 off = j == 0 ? ivec2(0) : ivec2((jitter * 2.0 - 1.0) * 8.0);
                         float q_weight, q_seen;
@@ -575,7 +582,7 @@ void main() {
                             if (jacobian > GI_JACOBIAN_MAX || jacobian < 1.0 / GI_JACOBIAN_MAX) continue;
                         }
                         float pt = gi_target(q, from, n);
-                        float m = min(q_seen, j == 0 ? GI_HISTORY : GI_HISTORY / 4.0);
+                        float m = min(q_seen, j == 0 ? gi_history() : gi_history() / 4.0);
                         float w = pt * q_weight * m * jacobian;
                         sum += w;
                         seen += m;

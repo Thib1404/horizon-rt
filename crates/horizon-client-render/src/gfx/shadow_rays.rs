@@ -505,6 +505,8 @@ fn kernel(
                 ("EDGE_BAND", edge_band()),
                 ("HELD_LIGHT", held_light()),
                 ("HELD_REACH", held_reach()),
+                ("GI_REUSE", gi_reuse()),
+                ("GI_HISTORY", gi_history()),
             ],
             ..Default::default()
         },
@@ -1619,6 +1621,27 @@ fn edge_band() -> f64 {
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| (0.05..=0.9).contains(v))
         .unwrap_or(0.25)
+}
+
+/// Which reservoirs ReSTIR GI merges (shadow_rays.wgsl `GI_REUSE`): `HORIZON_RT_GI_REUSE=temporal`
+/// the last frame's alone, `none` none (each frame's own ray, the unbiased reference); otherwise
+/// the last frame's and two neighbours'.
+fn gi_reuse() -> f64 {
+    match std::env::var("HORIZON_RT_GI_REUSE").as_deref() {
+        Ok("temporal") => 1.0,
+        Ok("none") => 2.0,
+        _ => 0.0,
+    }
+}
+
+/// The candidates a GI reservoir keeps at most (shadow_rays.wgsl `GI_HISTORY`,
+/// `HORIZON_RT_GI_HISTORY`, 1 to 100), 20 without it.
+fn gi_history() -> f64 {
+    std::env::var("HORIZON_RT_GI_HISTORY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| (1.0..=100.0).contains(v))
+        .unwrap_or(20.0)
 }
 
 #[cfg(test)]
