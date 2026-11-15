@@ -416,6 +416,11 @@ impl SunPass {
             // Bits 7 to 15: which reservoirs ReSTIR GI merges and how many candidates it keeps
             // (the kernel's `GI_REUSE` and `GI_HISTORY`).
             pass.flags |= gi_reuse() << 7 | gi_history() << 9;
+            // Bit 16: the neighbours' samples merged unseen, as before
+            // (`HORIZON_RT_GI_NEIGHBOUR_RAYS=0`, the kernel's `GI_NEIGHBOUR_RAYS`).
+            if !gi_neighbour_rays() {
+                pass.flags |= 1 << 16;
+            }
             log::info!(
                 "Horizon RTX: a ray tracing pipeline for {}{}{}, shader execution reordering {}",
                 if kinds.sun { "the sun pass" } else { "" },
@@ -1144,6 +1149,12 @@ fn gi_reuse() -> u32 {
         Ok("none") => 2,
         _ => 0,
     }
+}
+
+/// Whether ReSTIR GI checks each neighbour's sample is seen before merging it
+/// (`HORIZON_RT_GI_NEIGHBOUR_RAYS=0`: no, as before).
+fn gi_neighbour_rays() -> bool {
+    std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() != Ok("0")
 }
 
 /// The candidates a GI reservoir keeps at most (`HORIZON_RT_GI_HISTORY`, 1 to 100), 0 for the

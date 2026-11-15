@@ -1160,6 +1160,21 @@ fn gi_jacobian(s: GiSample, seer: vec3<f32>, to: vec3<f32>) -> f32 {
     if cos_from < 1e-4 { return 0.0; }
     return cos_to * da / (cos_from * db);
 }
+// Whether camera-relative `pos` sees sample point `at`: with hardware rays against the triangles
+// the sample was found on (`hw_visible`), else (and with `HORIZON_RT_GI_DDA=1`) through the voxel
+// grid, a long cave's ray taken as stopped once its budget is spent.
+fn gi_sees(pos: vec3<f32>, at: vec3<f32>) -> bool {
+    let to = at - pos;
+    let d = length(to);
+    let reach = select(d - 0.05, 1e30, d > 4000.0);
+    if HW && GI_HW_VISIBILITY {
+        return hw_visible(pos, to / d, min(reach, 4096.0));
+    }
+    return ray(pos, to / d, SKY_BUDGET, reach) >= 0.5;
+}
+// `HORIZON_RT_GI_NEIGHBOUR_RAYS=0`: the neighbours' samples merged unseen and only the chosen one
+// checked, as before (`restir_gi`).
+override GI_NEIGHBOUR_RAYS: bool = true;
 fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>, has_last: bool)
     -> vec4<f32> {
     // The bounce pass's reservoir where it made one: the light it stands for, as below.
@@ -1183,6 +1198,8 @@ fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>,
     var sum = luminance(own.light) * 3.14159265;
     var seen = 1.0;
     var reused = false;
+    // Whether the chosen sample's visibility is known (a neighbour's, checked as it was merged).
+    var checked = false;
     // White (`random2`), not `blue2`: which candidate the reservoir keeps and which neighbours it
     // merges must not correlate with the neighbours' own choices (whose samples it takes).
     var u = random2(texel, 70u);
@@ -1215,6 +1232,14 @@ fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>,
                 jacobian = gi_jacobian(q.s, there, pos);
                 if jacobian > GI_JACOBIAN_MAX || jacobian < 1.0 / GI_JACOBIAN_MAX { continue; }
             }
+            // A neighbour's sample this pixel doesn't see is left out before it is weighed. Merged
+            // unseen, its weight stayed in the reservoir's sum while another sample was kept (and
+            // when it was the one kept, the visibility ray below swapped in the pixel's own): a
+            // bright sample a neighbour saw through an opening (the sky, a sunlit patch) made the
+            // reservoir hold more light than the pixel gets, and the last frame's reservoir,
+            // merged again each frame, built it up (a lit room 2.7 times too bright, in blotches
+            // and streaks). The last frame's own sample was seen from this point already.
+            if j > 0 && GI_NEIGHBOUR_RAYS && !gi_sees(pos, q.s.at) { continue; }
             let p = gi_target(q.s, pos, n);
             // The neighbours' history counts for less than the pixel's own (no blotches of one
             // sample spread over a patch).
@@ -1227,25 +1252,16 @@ fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>,
                 chosen = q.s;
                 aim = p;
                 reused = true;
+                checked = j > 0 && GI_NEIGHBOUR_RAYS;
             }
         }
     }
     var weight = 0.0;
     if aim > 0.0 { weight = sum / (seen * aim); }
-    // A sample from elsewhere: this pixel has to see it.
-    if reused && aim > 0.0 {
-        let to = chosen.at - pos;
-        let d = length(to);
-        let reach = select(d - 0.05, 1e30, d > 4000.0);
-        // With hardware rays against the triangles the sample was found on (`hw_visible`), else
-        // (and with `HORIZON_RT_GI_DDA=1`) through the voxel grid, a long cave's ray taken as
-        // stopped once its budget is spent.
-        var visible = true;
-        if HW && GI_HW_VISIBILITY {
-            visible = hw_visible(pos, to / d, min(reach, 4096.0));
-        } else {
-            visible = ray(pos, to / d, SKY_BUDGET, reach) >= 0.5;
-        }
+    // A sample from elsewhere: this pixel has to see it (the last frame's, a block placed since;
+    // a neighbour's was checked above unless `GI_NEIGHBOUR_RAYS` is off).
+    if reused && !checked && aim > 0.0 {
+        let visible = gi_sees(pos, chosen.at);
         if !visible {
             chosen = own;
             aim = gi_target(own, pos, n);

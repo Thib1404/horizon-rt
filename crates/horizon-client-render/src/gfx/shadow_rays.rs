@@ -507,6 +507,12 @@ fn kernel(
                 ("HELD_REACH", held_reach()),
                 ("GI_REUSE", gi_reuse()),
                 ("GI_HISTORY", gi_history()),
+                (
+                    "GI_NEIGHBOUR_RAYS",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() != Ok("0"),
+                    )),
+                ),
             ],
             ..Default::default()
         },

@@ -83,7 +83,7 @@ layout(set = 0, binding = 24) readonly buffer Cache { uint w[]; } cache;
 // the kernel's `SKIP` 16 (the bounced light never rests); bit 5: its `SKIP_GI_JACOBIAN` (the
 // neighbours' samples with a Jacobian of 1, as before); bit 6: its `SKIP_NORMAL_NEAREST` (a
 // pixel's normal from its nearer neighbours, as before); bits 7 and 8: its `GI_REUSE`; bits 9
-// to 15: its `GI_HISTORY` (0 for 20).
+// to 15: its `GI_HISTORY` (0 for 20); bit 16: its `GI_NEIGHBOUR_RAYS` off (as before).
 layout(push_constant) uniform Push { uint sprite_split; uint flags; } push;
 
 // sun.rahit sets it below 0 when a ray met a translucent quad (and let it through).
@@ -389,6 +389,14 @@ bool trace_hit(vec3 from, vec3 d, float reach, out float t, out vec3 normal, out
     albedo = colour;
     return colour.x >= 0.0;
 }
+// The kernel's `gi_sees`: whether `from` sees sample point `at`.
+bool blocked(vec3 from, vec3 d, float reach);
+bool gi_sees(vec3 from, vec3 at) {
+    vec3 to = at - from;
+    float d = length(to);
+    float far = d > 4000.0 ? REACH : d - 0.05;
+    return !blocked(from, to / d, far);
+}
 // Whether a ray from `from` along `d` meets anything opaque within `reach`.
 bool blocked(vec3 from, vec3 d, float reach) {
     payload = 0.0;
@@ -555,6 +563,7 @@ void main() {
                 float sum = luminance(own.light) * 3.14159265;
                 float seen = 1.0;
                 bool reused = false;
+                bool checked = false;
                 vec2 u = random2(texel, 70u);
                 if (has_last) {
                     for (int j = 0; j < 3; j++) {
@@ -581,6 +590,9 @@ void main() {
                             jacobian = gi_jacobian(q, there, from);
                             if (jacobian > GI_JACOBIAN_MAX || jacobian < 1.0 / GI_JACOBIAN_MAX) continue;
                         }
+                        // The kernel's: a neighbour's sample this pixel doesn't see is left out.
+                        bool neighbour_rays = (push.flags & 65536u) == 0u;
+                        if (j > 0 && neighbour_rays && !gi_sees(from, q.at)) continue;
                         float pt = gi_target(q, from, n);
                         float m = min(q_seen, j == 0 ? gi_history() : gi_history() / 4.0);
                         float w = pt * q_weight * m * jacobian;
@@ -591,15 +603,13 @@ void main() {
                             chosen = q;
                             aim = pt;
                             reused = true;
+                            checked = j > 0 && neighbour_rays;
                         }
                     }
                 }
                 float weight = aim > 0.0 ? sum / (seen * aim) : 0.0;
-                if (reused && aim > 0.0) {
-                    vec3 to = chosen.at - from;
-                    float d = length(to);
-                    float far = d > 4000.0 ? REACH : d - 0.05;
-                    if (blocked(from, to / d, far)) {
+                if (reused && !checked && aim > 0.0) {
+                    if (!gi_sees(from, chosen.at)) {
                         chosen = own;
                         aim = gi_target(own, from, n);
                         weight = aim > 0.0 ? 3.14159265 * luminance(own.light) / aim : 0.0;
