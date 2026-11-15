@@ -507,6 +507,7 @@ fn kernel(
                 ("HELD_REACH", held_reach()),
                 ("GI_REUSE", gi_reuse()),
                 ("GI_HISTORY", gi_history()),
+                ("GI_BOUNCE", f64::from(gi_bounce())),
                 (
                     "GI_NEIGHBOUR_RAYS",
                     f64::from(u8::from(
@@ -581,6 +582,18 @@ fn denoiser(
         },
         cache: None,
     })
+}
+
+/// `HORIZON_RT_GI_BOUNCE` (a diagnosis, shadow_rays.wgsl `GI_BOUNCE`): the light at a bounce's hit
+/// besides the sun's from `cache` only, `screen` (the last frame's) only, or `traced` (neither: a
+/// second bounce); otherwise the cache, else the last frame's.
+pub fn gi_bounce() -> u32 {
+    match std::env::var("HORIZON_RT_GI_BOUNCE").as_deref() {
+        Ok("cache") => 1,
+        Ok("screen") => 2,
+        Ok("traced") => 3,
+        _ => 0,
+    }
 }
 
 /// `HORIZON_RT_SKIP`'s bit for the denoiser's early-out (denoise.wgsl `SKIP_EARLY_OUT`): set, every

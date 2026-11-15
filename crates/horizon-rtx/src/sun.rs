@@ -434,6 +434,9 @@ impl SunPass {
             if std::env::var("HORIZON_RT_GI_SPATIAL_FEEDBACK").as_deref() == Ok("1") {
                 pass.flags |= 1 << 19;
             }
+            // Bits 20-21: the light at a bounce's hit besides the sun's (`HORIZON_RT_GI_BOUNCE`:
+            // 1 `cache` only, 2 `screen` only, 3 `traced`, neither).
+            pass.flags |= gi_bounce() << 20;
             log::info!(
                 "Horizon RTX: a ray tracing pipeline for {}{}{}, shader execution reordering {}",
                 if kinds.sun { "the sun pass" } else { "" },
@@ -1161,6 +1164,17 @@ fn gi_reuse() -> u32 {
         Ok("temporal") => 1,
         Ok("none") => 2,
         Ok("spatial") => 3,
+        _ => 0,
+    }
+}
+
+/// The light at a bounce's hit besides the sun's (horizon-client-render gfx/shadow_rays.rs
+/// `gi_bounce`, the same rule): `HORIZON_RT_GI_BOUNCE=cache` (1), `screen` (2), `traced` (3).
+fn gi_bounce() -> u32 {
+    match std::env::var("HORIZON_RT_GI_BOUNCE").as_deref() {
+        Ok("cache") => 1,
+        Ok("screen") => 2,
+        Ok("traced") => 3,
         _ => 0,
     }
 }

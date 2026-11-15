@@ -959,10 +959,17 @@ fn sun_on(lifted: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 // `HORIZON_RT_GI_ONE_BOUNCE=1` (a diagnosis): no light but the sun's at a bounce ray's hit, so
 // the bounced light can't feed itself back through the cache or the last frame.
 override GI_ONE_BOUNCE: bool = false;
+// `HORIZON_RT_GI_BOUNCE` (a diagnosis): 0 the cache, else the last frame's light (as always), 1
+// the cache only, 2 the last frame's only, 3 neither (a traced second bounce, else the open
+// sky's guess).
+override GI_BOUNCE: u32 = 0u;
 fn cached_on(at: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
     if GI_ONE_BOUNCE { return vec4(0.0, 0.0, 0.0, 1.0); }
-    let cached = cache_light(at, n);
-    if cached.a >= 0.0 { return cached; }
+    if GI_BOUNCE != 2u && GI_BOUNCE != 3u {
+        let cached = cache_light(at, n);
+        if cached.a >= 0.0 { return cached; }
+    }
+    if GI_BOUNCE == 1u || GI_BOUNCE == 3u { return vec4(0.0, 0.0, 0.0, -1.0); }
     return last_light(at);
 }
 // The light leaving a surface at camera-relative `at` (normal `n`, colour `albedo`) toward where

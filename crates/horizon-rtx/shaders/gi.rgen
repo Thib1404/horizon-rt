@@ -332,8 +332,14 @@ vec4 last_light(vec3 at) {
 vec4 cached_on(vec3 at, vec3 n) {
     // The kernel's `GI_ONE_BOUNCE` (flag bit 18): no light but the sun's at a hit.
     if ((push.flags & 262144u) != 0u) return vec4(0.0, 0.0, 0.0, 1.0);
-    vec4 cached = cache_light(at, n);
-    if (cached.a >= 0.0) return cached;
+    // The kernel's `GI_BOUNCE` (flag bits 20-21): 1 the cache only, 2 the last frame only, 3
+    // neither (a traced second bounce).
+    uint source = (push.flags >> 20u) & 3u;
+    if (source != 2u && source != 3u) {
+        vec4 cached = cache_light(at, n);
+        if (cached.a >= 0.0) return cached;
+    }
+    if (source == 1u || source == 3u) return vec4(0.0, 0.0, 0.0, -1.0);
     return last_light(at);
 }
 // The kernel's `restir_last`: where camera-relative `pos` was in the last frame's masks (xy), z 1
