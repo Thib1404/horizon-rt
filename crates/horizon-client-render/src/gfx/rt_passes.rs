@@ -228,12 +228,15 @@ impl Renderer {
         let view = self.eye.map_or(0, |e| e.view_index);
         let grid = self.voxels.views().expect("the grid runs");
         let lights = self.voxels.light_buffers().expect("the grid runs");
-        self.far_heights.prepare(
-            &self.device,
-            &self.queue,
-            encoder,
-            [rt.light[0], rt.light[1], rt.light[2]],
-        );
+        // HORIZON_RT_SKIP=64 leaves the far field out: its pass too.
+        if !self.shadow_rays.far_skipped() {
+            self.far_heights.prepare(
+                &self.device,
+                &self.queue,
+                encoder,
+                [rt.light[0], rt.light[1], rt.light[2]],
+            );
+        }
         let hw = self.hw_bindings();
         // The RTX 4090 build's sun pass (horizon-rtx `sun`): recorded by the kernel's run once
         // its uniform is written, with the structure built raw and the hybrid's bindings.

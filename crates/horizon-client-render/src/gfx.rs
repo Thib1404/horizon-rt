@@ -11275,7 +11275,7 @@ impl Renderer {
         laps.lap("rp_world");
         // Ray-traced shadows: a ray a pixel of the world's depth, before the resolve (RT lighting
         // traced its rays before the world).
-        if shadows && !rt_now {
+        if shadows && !rt_now && !self.shadow_rays.far_skipped() {
             self.far_heights.prepare(
                 &self.device,
                 &self.queue,

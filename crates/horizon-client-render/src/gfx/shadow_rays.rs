@@ -640,6 +640,11 @@ fn resolver(
 }
 
 impl ShadowRays {
+    /// Whether `SKIP` leaves the far field out (64): its pass need not run either
+    /// (far_heights.rs `prepare`).
+    pub fn far_skipped(&self) -> bool {
+        self.skip & 64 != 0
+    }
     /// Makes the kernel again leaving out what `skip` says (shadow_rays.wgsl `SKIP`: 1 the sun's
     /// ray, 2 ReSTIR GI, 4 ReSTIR DI, 8 the PSR, 16 the bounced light's turns; 32 VR's second
     /// eye's own light, `SHARE_EYES`; 64 the far field, 128 the translucent tint, 32768 a dark history
