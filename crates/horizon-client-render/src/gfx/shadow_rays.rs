@@ -920,7 +920,7 @@ impl ShadowRays {
         let skip = std::env::var("HORIZON_RT_SKIP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(64); // Far field off by default: since main its shadows fall in 16-block squares.
+            .unwrap_or(0); // The far field on again (far_heights.rs `Claim`); 64 turns it off.
         let pipeline = kernel(device, &pipeline_layout, &shader, "cs_shadow", skip);
         // The sparse zone's rays, a thread a block, before `pipeline`.
         let sparse_pipeline = kernel(device, &pipeline_layout, &shader, "cs_sparse", skip);

@@ -54,6 +54,9 @@ const BUDGET: usize = 2048;
 /// A drawn distant tile's cells' heights (`i16::MIN` none).
 struct FarTile {
     origin: [i32; 2],
+    /// Its level (`TileKey::level`): where tiles overlap, the finest one's cells are the terrain
+    /// (`Claim`).
+    level: u8,
     stride: i32,
     cells: usize,
     heights: Vec<i16>,
@@ -182,6 +185,8 @@ pub struct FarHeights {
     pass: ChunkSet,
     /// The pyramid, finest first, slots toroidal.
     levels: Vec<Vec<i16>>,
+    /// Which tile's level wrote each finest texel (`Claim`), `NONE` where none did.
+    owners: Vec<u8>,
     texture: Option<(wgpu::Texture, wgpu::TextureView)>,
     /// The window's first texel (world texel coordinates, multiples of `CHUNK_TEXELS`), once built.
     origin: Option<[i32; 2]>,
@@ -342,6 +347,7 @@ impl FarHeights {
                     let origin = key.origin();
                     let tile = FarTile {
                         origin: [origin[0], origin[2]],
+                        level: key.level,
                         stride: key.size() / 16,
                         cells: 16,
                         heights: columns.iter().map(height).collect(),
@@ -481,6 +487,7 @@ impl FarHeights {
             self.levels = (0..LEVELS)
                 .map(|l| vec![MIN_Y as i16; (SIZE >> l) * (SIZE >> l)])
                 .collect();
+            self.owners = vec![Claim::NONE; SIZE * SIZE];
         }
         let n = CHUNKS as i32;
         let (ox, oz) = (origin[0] / CHUNK_TEXELS, origin[1] / CHUNK_TEXELS);
@@ -499,6 +506,7 @@ impl FarHeights {
                         let row = (sz as usize * CHUNK_TEXELS as usize + dz) * SIZE
                             + sx as usize * CHUNK_TEXELS as usize;
                         level0[row..row + CHUNK_TEXELS as usize].fill(MIN_Y as i16);
+                        self.owners[row..row + CHUNK_TEXELS as usize].fill(Claim::NONE);
                     }
                     from_tiles.insert(slot);
                 }
@@ -511,7 +519,8 @@ impl FarHeights {
                 for cz in z0.max(oz)..=z1.min(oz + n - 1) {
                     for cx in x0.max(ox)..=x1.min(ox + n - 1) {
                         if from_tiles.contains(ChunkSet::slot(cx, cz)) {
-                            tile_texels(level0, tile, (cx, cz));
+                            let mut claim = Claim::new(&mut *level0, &mut self.owners, tile.level);
+                            tile_texels(&mut claim, tile, (cx, cz));
                         }
                     }
                 }
@@ -728,7 +737,7 @@ fn chunk_texels(
 
 /// `tile`'s cells over chunk column `chunk`'s texels of `level0`, each the highest of what is
 /// there and the cells over it: a cell covers the texels of its blocks.
-fn tile_texels(level0: &mut [i16], tile: &FarTile, chunk: (i32, i32)) {
+fn tile_texels(level0: &mut Claim, tile: &FarTile, chunk: (i32, i32)) {
     let n = SIZE as i32;
     let s = tile.stride;
     if s >= 4 && sloped() {
@@ -758,7 +767,7 @@ fn tile_texels(level0: &mut [i16], tile: &FarTile, chunk: (i32, i32)) {
             for tz in tz0..=tz1 {
                 for tx in tx0..=tx1 {
                     let i = ((tz & (n - 1)) * n + (tx & (n - 1))) as usize;
-                    level0[i] = level0[i].max(h);
+                    level0.put(i, h);
                 }
             }
         }
@@ -776,7 +785,7 @@ fn sloped() -> bool {
 /// the height between the four cells' middles around it, not its own cell's. A cell 16 blocks
 /// wide written flat made the far hills terraces of squares, and their shadows fell in
 /// 16-block squares. A cell without a height leaves the texels nearest to it.
-fn tile_slopes(level0: &mut [i16], tile: &FarTile, chunk: (i32, i32)) {
+fn tile_slopes(level0: &mut Claim, tile: &FarTile, chunk: (i32, i32)) {
     let n = SIZE as i32;
     let s = tile.stride;
     let [x0, z0] = tile.origin;
@@ -817,9 +826,50 @@ fn tile_slopes(level0: &mut [i16], tile: &FarTile, chunk: (i32, i32)) {
                 (top + (bottom - top) * fz).round() as i16
             };
             let i = ((tz & (n - 1)) * n + (tx & (n - 1))) as usize;
-            level0[i] = level0[i].max(h);
+            level0.put(i, h);
         }
     }
+}
+
+/// A tile's cells going into the finest level where tiles overlap. The far terrain draws a
+/// coarse tile standing in for finer ones still loading (or two levels up, behind a loading
+/// leaf: `Plan::stands_in`, `Plan::backdrop`) with its mesh clipped around every finer tile
+/// drawn; the far field took the highest of all, so a stand-in's cells, 16 blocks wide and each
+/// as high as the highest block under it, stood over the finer terrain as a field of flat
+/// squares, and their shadows fell in 16-block squares. Now a texel holds its finest tile's
+/// cells (the highest of them where two of its cells meet it), as the terrain is drawn.
+/// `HORIZON_RT_FAR_FINEST=0`: the highest of every tile, as before.
+struct Claim<'a> {
+    level0: &'a mut [i16],
+    owners: &'a mut [u8],
+    level: u8,
+}
+impl<'a> Claim<'a> {
+    /// No tile wrote the texel.
+    const NONE: u8 = u8::MAX;
+    fn new(level0: &'a mut [i16], owners: &'a mut [u8], level: u8) -> Self {
+        Self {
+            level0,
+            owners,
+            level,
+        }
+    }
+    fn put(&mut self, i: usize, h: i16) {
+        let owner = self.owners[i];
+        if self.level < owner && finest() {
+            self.level0[i] = h;
+            self.owners[i] = self.level;
+        } else if self.level == owner || !finest() {
+            self.level0[i] = self.level0[i].max(h);
+            self.owners[i] = owner.min(self.level);
+        }
+    }
+}
+
+/// Whether the finest tile's cells win over a coarser one's where they overlap (`Claim`).
+fn finest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HORIZON_RT_FAR_FINEST").map_or(true, |v| v.trim() != "0"))
 }
 
 /// Level `l`'s texel in slot (x, y): the highest of its four in the level below.
@@ -966,14 +1016,16 @@ mod tests {
             .collect();
         let tile = FarTile {
             origin: [0, 0],
+            level: 4,
             stride: 16,
             cells,
             heights,
             source: Arc::new(Vec::new()),
         };
         let mut level0 = vec![MIN_Y as i16; SIZE * SIZE];
+        let mut owners = vec![Claim::NONE; SIZE * SIZE];
         for cx in 0..4 {
-            tile_slopes(&mut level0, &tile, (cx, 1));
+            tile_slopes(&mut Claim::new(&mut level0, &mut owners, 4), &tile, (cx, 1));
         }
         // Blocks 8 and 24 are the first two cells' middles: texel 4 starts at block 8.
         let row = 12 * SIZE;
@@ -1036,9 +1088,11 @@ mod tests {
             .map(|l| vec![MIN_Y as i16; (SIZE >> l) * (SIZE >> l)])
             .collect();
         let level0 = &mut levels[0];
+        let mut owners = vec![Claim::NONE; SIZE * SIZE];
         let slot = |tx: i32, tz: i32| ((tz & mask) * n + (tx & mask)) as usize;
         let window = [origin[0], origin[1], origin[0] + n, origin[1] + n];
         for tile in far.far.values() {
+            let mut claim = Claim::new(&mut *level0, &mut owners, tile.level);
             let size = tile.stride * tile.cells as i32;
             let [x0, z0] = tile.origin;
             if (x0 + size) >> SHIFT <= window[0]
@@ -1078,8 +1132,7 @@ mod tests {
                             let (top, bottom) = (a + (b - a) * fx, c + (d - c) * fx);
                             (top + (bottom - top) * fz).round() as i16
                         };
-                        let s = slot(tx, tz);
-                        level0[s] = level0[s].max(value);
+                        claim.put(slot(tx, tz), value);
                     }
                 }
                 continue;
@@ -1098,8 +1151,7 @@ mod tests {
                     let tx1 = ((bx + tile.stride - 1) >> SHIFT).min(window[2] - 1);
                     for tz in tz0..=tz1 {
                         for tx in tx0..=tx1 {
-                            let s = slot(tx, tz);
-                            level0[s] = level0[s].max(h);
+                            claim.put(slot(tx, tz), h);
                         }
                     }
                 }
@@ -1216,6 +1268,55 @@ mod tests {
         assert_eq!(at(3, -4, -4), 100);
         assert_eq!(far.top, 120);
         assert!(gpu == far.levels);
+    }
+
+    /// A coarse tile standing in for finer ones, drawn with them: where a finer tile is drawn its
+    /// cells are the terrain, not the stand-in's higher flat squares; the stand-in fills the rest.
+    #[test]
+    fn a_finer_tile_wins_over_the_coarse_one_standing_in_around_it() {
+        let mut far = FarHeights::default();
+        let coarse = TileKey {
+            x: 0,
+            z: 0,
+            level: 4,
+        };
+        let fine = TileKey {
+            x: 1,
+            z: 1,
+            level: 0,
+        };
+        let high = Arc::new((0..256).map(|_| column(200)).collect::<Vec<_>>());
+        let low = Arc::new(
+            (0..256)
+                .map(|i| {
+                    column(if [0, 1, 16, 17].contains(&i) {
+                        i16::MIN
+                    } else {
+                        70
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+        far.set_far(1, [(coarse, &high), (fine, &low)].into_iter());
+        let (mut gpu, mut now) = (Vec::new(), Instant::now());
+        settle(
+            &mut far,
+            &mut gpu,
+            DVec3::new(100.0, 70.0, 100.0),
+            &mut now,
+            &FxHashMap::default(),
+        );
+        let n = SIZE as i32;
+        let at = |tx: i32, tz: i32| far.levels[0][((tz & (n - 1)) * n + (tx & (n - 1))) as usize];
+        // The fine tile covers blocks 16..32, texels 8..16.
+        assert_eq!(at(9, 8), 70);
+        assert_eq!(at(15, 15), 70);
+        // Its first 2x2 cells have no height: their texel keeps the stand-in's.
+        assert_eq!(at(8, 8), 200);
+        assert_eq!(at(7, 8), 200);
+        assert_eq!(at(16, 8), 200);
+        assert!(gpu == far.levels);
+        assert!(far.levels == rebuilt(&far, far.origin.unwrap()));
     }
 
     /// Flying over a synthetic terrain, the distant tiles coming, going and changing, chunk
