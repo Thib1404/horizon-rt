@@ -339,6 +339,7 @@ mod tests {
 
     #[test]
     fn successful_readback_releases_slot() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, _queue, mut timer)) = mapped_timer() else {
             eprintln!("Skipping GPU timer test: no timestamp-capable adapter");
             return;
@@ -354,6 +355,7 @@ mod tests {
 
     #[test]
     fn destroyed_readback_stops_timing_without_unmapping() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue, mut timer)) = mapped_timer() else {
             eprintln!("Skipping GPU timer test: no timestamp-capable adapter");
             return;

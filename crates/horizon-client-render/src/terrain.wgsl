@@ -89,6 +89,12 @@ struct Globals {
     linear: vec4<f32>,
     // What `hdr_written` reads (hdr_light.wgsl): the display's headroom, the look and debug.
     hdr_settings: vec4<f32>,
+    // The eye fog is measured from, camera-relative: zero but in a mod's world view.
+    view_origin: vec4<f32>,
+    // A mod's world view's own, zero outside one (gfx/world_views.rs's `ViewCamera`): x -1 when
+    // mirrored (its screen runs right to left), else 1; y the clip-space depth its clip plane's
+    // entities come forward (`fs_entity_clipped`), 0 without one; z 1 with a clip plane.
+    world_view: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var sprites: texture_2d_array<f32>;
@@ -357,8 +363,7 @@ struct TerrainOut {
     // How the face shines in HDR output (mesher.rs's `EMISSION_BITS`): 0 not
     // at all, 1 to 4 the tier with its bright parts, 5 to 8 the tier all over.
     emission: u32,
-    // Block and sky light over 16, the light a world warp's fragment is given
-    // (gfx/world_warp_fragment.wgsl).
+    // Block and sky light over 16.
     scene: vec2<f32>,
     fade: u32,
     // A distant tile's tile-relative position, for its fade (`faded`).
@@ -377,10 +382,6 @@ struct TerrainOut {
     // sea's (its colour's alpha's high nibble, mesher.rs `with_sea`), blended across the biomes
     // as their colours are.
     tint: vec4<f32>,
-    // [world warp varyings]
-    // (a native mod's world warp adds its own here, and in `TerrainWire`, `to_wire` and
-    // `from_wire`: gfx/world_warp.rs)
-    // [end world warp varyings]
 }
 // `TerrainOut` in 7 interpolant locations instead of 15 (5 and RT lighting's 2). A GPU's vertex stage pays for each
 // location it exports (AMD's parameter cache gives one a whole slot, however few of its four
@@ -402,11 +403,9 @@ struct TerrainWire {
     @location(3) d: vec4<f32>,
     // `layer`, `emission`, `fade` and `emissive_layer`.
     @location(4) @interpolate(flat) e: vec4<u32>,
-    // RT lighting's `tint`; and `pos` with `light`'s sky light. After the world warp's 5 and 6.
-    @location(7) f: vec4<f32>,
-    @location(8) g: vec4<f32>,
-    // [world warp wire]
-    // [end world warp wire]
+    // RT lighting's `tint`; and `pos` with `light`'s sky light.
+    @location(5) f: vec4<f32>,
+    @location(6) g: vec4<f32>,
 }
 fn to_wire(o: TerrainOut) -> TerrainWire {
     var w: TerrainWire;
@@ -418,8 +417,6 @@ fn to_wire(o: TerrainOut) -> TerrainWire {
     w.e = vec4(o.layer, o.emission, o.fade, o.emissive_layer);
     w.f = o.tint;
     w.g = vec4(o.pos, o.light.x);
-    // [world warp to wire]
-    // [end world warp to wire]
     return w;
 }
 fn from_wire(w: TerrainWire) -> TerrainOut {
@@ -440,8 +437,6 @@ fn from_wire(w: TerrainWire) -> TerrainOut {
     o.tint = w.f;
     o.pos = w.g.xyz;
     o.light = vec2(w.g.w, w.d.w);
-    // [world warp from wire]
-    // [end world warp from wire]
     return o;
 }
 // Whether a fading tile or section leaves this pixel out (gfx/lod.rs's
@@ -502,6 +497,12 @@ fn fade_depth(clip: vec4<f32>, w: f32) -> vec4<f32> {
         // little out of the real ones, and the tile coming in under it hid it
         // at once, before its fade.
         scale *= 1.02;
+    }
+    // A world view's clip plane is its near plane, `z = w` (gfx/world_views.rs's `near_plane_on`):
+    // there the offset scales the depth in front of the plane, `w - z`, which keeps the plane
+    // where it is.
+    if globals.world_view.z != 0.0 {
+        return vec4(clip.xy, clip.w - (clip.w - clip.z) / scale, clip.w);
     }
     return vec4(clip.xy, clip.z * scale, clip.w);
 }
@@ -1012,9 +1013,6 @@ fn wind_offset(pos: vec3<f32>, uv: vec2<f32>, layer: u32, sky: f32, pinned: bool
 // WIND-END
 fn terrain_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f32>,
     light: vec2<u32>, origin: vec3<f32>, w: f32) -> TerrainOut {
-    // [world warp vertex]
-    // (a world warp's pipelines put the point through the mod's `world_warp`: gfx/world_warp.rs;
-    // they leave the wind and the Earth's curvature out)
     var local = position + origin;
     // The sections' vertices (not the distant terrain's tiles, whose UVs repeat by block) sway.
     if instance_step(w) < 0.001 {
@@ -1022,7 +1020,6 @@ fn terrain_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f3
             wind_pinned(position.y));
     }
     let pos = earth_curved(local, w);
-    // [end world warp vertex]
     var out: TerrainOut;
     out.clip = fade_depth(globals.view_proj * vec4(pos, 1.0), w);
     out.local = position;
@@ -1058,14 +1055,13 @@ fn terrain_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f3
     }
     out.emission = 15u - (u32(round(color.a * 255.0)) & 15u);
     out.height = pos.y;
-    out.spherical = length(pos);
-    out.cylindrical = max(length(pos.xz), abs(pos.y));
+    let eye = pos - globals.view_origin.xyz;
+    out.spherical = length(eye);
+    out.cylindrical = max(length(eye.xz), abs(eye.y));
     out.fade = fade_code(w);
     const CHUNK_FULLY_VISIBLE_RANGE: f32 = 16.0;
     out.visibility = mix(1.0, instance_visibility(w),
         clamp((length(pos) - CHUNK_FULLY_VISIBLE_RANGE) / CHUNK_FULLY_VISIBLE_RANGE, 0.0, 1.0));
-    // [world warp out]
-    // [end world warp out]
     return out;
 }
 fn linear_fog(d: f32, start: f32, end: f32) -> f32 {

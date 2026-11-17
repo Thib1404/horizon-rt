@@ -13,8 +13,8 @@
 //! speed (default 30,3: a breeze toward the south-east).
 extern crate horizon_client_lib as horizon_client;
 use horizon_client::gfx::wind;
+use horizon_core::nbt::{Limits, Tag};
 use horizon_core::position::ChunkPos;
-use horizon_world::nbt::{Limits, Tag};
 use horizon_world::region::RegionFile;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
