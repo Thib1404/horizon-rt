@@ -112,13 +112,18 @@ impl Renderer {
         });
         self.pack_post = Some((dimension, post));
         if self.pack_post.as_ref().is_some_and(|p| p.1.is_some()) {
-            self.replace_native(None);
+            self.replace_executor(None);
         }
         Ok(report)
     }
-    /// Sets the external shader pipeline world frames call (`external`), or none.
-    pub fn set_external_pipeline(&mut self, pipeline: Option<Box<dyn external::ExternalPipeline>>) {
-        self.external = pipeline;
+    /// Sets the external shader pipeline world frames call (`external`), or none. Why it was
+    /// refused, if it was (`ExternalPipeline::take_over`): then the one that ran keeps running,
+    /// unless it can't.
+    pub fn set_external_pipeline(
+        &mut self,
+        pipeline: Option<Box<dyn external::ExternalPipeline>>,
+    ) -> Option<String> {
+        self.replace_executor(pipeline)
     }
     /// Makes the running shader pack, of either kind, forget what it kept from earlier frames:
     /// the next frame draws as a freshly loaded pack's first. Nothing to do without a pack.
@@ -132,10 +137,6 @@ impl Renderer {
         if let Some((_, Some(post))) = &mut self.pack_post {
             post.reset_history(&self.device);
         }
-        if let Some(native) = &mut self.native {
-            native.frame.reset_history();
-            native.post.reset_history();
-        }
     }
     /// The running shader pack's kind: `iris` (a `shaders/` pack) or `native` (one of
     /// Horizon's own).
@@ -148,7 +149,7 @@ impl Renderer {
     }
     /// The running Horizon pack's name, from its manifest.
     pub fn native_pack_name(&self) -> Option<&str> {
-        self.native.as_ref().map(|pack| pack.name.as_str())
+        self.pack_metadata.as_ref().map(|pack| pack.name.as_str())
     }
     /// `screenshot-sequence`: waits (30 seconds at most) for the frame just drawn to finish on
     /// the GPU, and takes the centre depth a `shaders/` pack copied in it, which its next frame
@@ -311,7 +312,7 @@ impl Renderer {
     pub fn drop_shader_packs(&mut self) {
         self.pack_loading = None;
         self.pack_post = None;
-        self.replace_native(None);
+        self.replace_executor(None);
         self.pack_atlas = None;
         self.separate_ao = false;
     }
@@ -352,7 +353,7 @@ impl Renderer {
             );
         }
         let Some((report, constants, sprite_tags, sprite_materials, lights)) = pack else {
-            self.replace_native(None);
+            self.replace_executor(None);
             return Ok(Vec::new());
         };
         let terrain = native_material::TerrainShape {
@@ -370,6 +371,7 @@ impl Renderer {
             weather_groups: [&self.weather.entity_layout, &self.weather.time_layout],
             pbr: self.pbr_maps.as_ref().and_then(|arrays| arrays.first()),
         };
+        let metadata = native_pack::Metadata::of(&report);
         let (pack, labels) = native_pack::NativePack::new(
             &self.device,
             &self.queue,
@@ -378,9 +380,10 @@ impl Renderer {
             &constants,
             lights,
         )?;
-        if let Some(refused) = self.replace_native(Some(pack)) {
+        if let Some(refused) = self.replace_executor(Some(Box::new(pack))) {
             return Err(refused);
         }
+        self.pack_metadata = Some(metadata);
         self.pack_post = None;
         self.pack_atlas = None;
         self.pack_material_atlases = None;

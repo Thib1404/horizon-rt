@@ -384,11 +384,15 @@ impl Renderer {
         // Shader packs size their targets for one view: with two sizes a frame they would be
         // made again for every view, so the quad views draw without them for now.
         let quad = views.len() > 2;
-        let packs = quad.then(|| (self.pack_post.take(), self.native.take()));
+        let packs = quad.then(|| {
+            let executor = self.executor.take();
+            (self.pack_post.take(), self.external.take(), executor)
+        });
         let drawn = self.draw_views(frame, &xr, &xr_frame, &views, body, origin, cull_view_proj);
-        if let Some((pack_post, native)) = packs {
+        if let Some((pack_post, external, executor)) = packs {
             self.pack_post = pack_post;
-            self.native = native;
+            self.external = external;
+            self.executor = executor;
         }
         drawn?;
         Ok(Some(xr_frame))
