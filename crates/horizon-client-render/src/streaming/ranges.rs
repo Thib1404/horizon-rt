@@ -91,7 +91,7 @@ impl Ranges<'_> {
     /// The columns meshed for drawing: those vanilla draws around the
     /// player (`in_view_distance`), and forced ones.
     pub(super) fn in_view(&self, x: i32, z: i32) -> bool {
-        in_view_distance(self.center, self.radius, x, z) || self.is_forced(x, z)
+        in_view_distance(self.center, self.radius, x, z) || self.forced.contains(&(x, z))
     }
     pub(super) fn in_main_range(&self, x: i32, z: i32, margin: i32) -> bool {
         let r = i64::from(self.radius + margin);

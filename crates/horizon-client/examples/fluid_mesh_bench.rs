@@ -54,11 +54,12 @@ fn main() -> Result<(), Error> {
     };
 
     let assets = Assets::load(&root)?;
-    let render = assets.reload(&root)?;
+    let resources = horizon_assets::resource_source::ResourceRoot::directory(root.clone());
+    let render = assets.reload(&resources)?;
     let facts = BlockFacts::load(&root, assets.registry)?;
     let visibility = models::load_visibility(&root, assets.registry)?;
-    let biomes = Biomes::load(&root)?;
-    let tables = MeshTables::new(&assets, &render, &facts, visibility)?;
+    let biomes = Biomes::load(&resources)?;
+    let tables = MeshTables::new(&assets, &render, &facts, visibility, None)?;
     let fluid_layers: Vec<u16> = ["water_still", "water_flow", "water_overlay", "lava_still"]
         .into_iter()
         .chain(["lava_flow"])
@@ -117,6 +118,8 @@ fn main() -> Result<(), Error> {
         shader_pack: false,
         translucent_layers: &[],
         leaf_culling: Default::default(),
+        hidden_states: &[],
+        part_tables: Default::default(),
         assets: &assets,
         render: &render,
         tables: &tables,

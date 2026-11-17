@@ -10,7 +10,7 @@ type Chunks = HashSet<(i32, i32)>;
 pub(super) struct Basis {
     player: ((i32, i32), Option<Band>, Option<i32>),
     extra: Vec<((i32, i32), i32)>,
-    forced: (Chunks, Chunks),
+    forced: Chunks,
 }
 
 /// Whether the queued jobs' ranking is out of date; it is brought up to date.
@@ -23,15 +23,11 @@ pub(super) fn basis_changed(s: &mut Streaming) -> bool {
             .map(super::ahead_sector),
     );
     let b = &mut s.queue_basis;
-    let same = b.player == player
-        && b.extra == s.extra
-        && b.forced.0 == s.forced
-        && b.forced.1 == s.mod_forced;
+    let same = b.player == player && b.extra == s.extra && b.forced == s.forced;
     if !same {
         b.player = player;
         b.extra.clone_from(&s.extra);
-        b.forced.0.clone_from(&s.forced);
-        b.forced.1.clone_from(&s.mod_forced);
+        b.forced.clone_from(&s.forced);
     }
     !same
 }
@@ -50,7 +46,7 @@ impl Ranges<'_> {
     /// ticks the chunk on the first tick (`ChunkMap.prepareTickingChunk`).
     pub(super) fn forced_distance(&self, x: i32, z: i32) -> i64 {
         const SIDE: usize = (2 * FORCED_TERRAIN_RING + 1) as usize;
-        let held = self.forced.len() + self.mod_forced.len();
+        let held = self.forced.len();
         if held == 0 {
             return i64::MAX;
         }
@@ -60,7 +56,8 @@ impl Ranges<'_> {
         };
         if held <= SIDE * SIDE {
             return self
-                .forced_chunks()
+                .forced
+                .iter()
                 .filter(|f| (x - f.0).abs().max((z - f.1).abs()) <= FORCED_TERRAIN_RING)
                 .map(|&f| d(f))
                 .min()
@@ -70,7 +67,7 @@ impl Ranges<'_> {
         (-FORCED_TERRAIN_RING..=FORCED_TERRAIN_RING)
             .flat_map(|dz| (-FORCED_TERRAIN_RING..=FORCED_TERRAIN_RING).map(move |dx| (dx, dz)))
             .map(|(dx, dz)| (x + dx, z + dz))
-            .filter(|f| self.is_forced(f.0, f.1))
+            .filter(|f| self.forced.contains(f))
             .map(d)
             .min()
             .unwrap_or(i64::MAX)
@@ -79,7 +76,7 @@ impl Ranges<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{GenerationInputs, GenerationScan, NO_CHUNKS};
+    use super::super::{GenerationInputs, GenerationScan};
     use super::*;
     use crate::fast_hash::{FxHashMap, FxHashSet};
     use crate::world::World;
@@ -97,7 +94,6 @@ mod tests {
             radius: 2,
             extra: &[],
             forced,
-            mod_forced: &NO_CHUNKS,
             ahead: None,
             cover: None,
             forced_cover: None,
@@ -177,7 +173,6 @@ mod tests {
                 radius: 2,
                 extra: &[],
                 forced,
-                mod_forced: &NO_CHUNKS,
                 ahead: None,
                 cover: None,
                 forced_cover: None,

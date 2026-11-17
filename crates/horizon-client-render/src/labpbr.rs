@@ -20,8 +20,6 @@
 //! A sprite without a map gets [`NEUTRAL`]: a flat, unoccluded, rough dielectric surface that
 //! emits nothing.
 
-use std::path::Path;
-
 /// The maps, in the order [`NEUTRAL`] and `MaterialPixels::maps` keep them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Map {
@@ -130,9 +128,10 @@ impl MaterialPixels {
 /// The material a resource pack declares (`optifine/texture.properties`'s `format`, as Iris
 /// reads it): `lab-pbr/1.3` for LabPBR packs such as SPBR. Maps load whatever it says; this
 /// only tells which standard they follow.
-pub fn declared_format(root: &Path) -> Option<String> {
-    let text =
-        std::fs::read_to_string(root.join("assets/minecraft/optifine/texture.properties")).ok()?;
+pub fn declared_format(source: &horizon_assets::resource_source::ResourceSource) -> Option<String> {
+    let text = source
+        .read_to_string("assets/minecraft/optifine/texture.properties")
+        .ok()?;
     text.lines()
         .filter_map(|line| line.split('#').next())
         .filter_map(|line| line.split_once('='))
@@ -347,13 +346,14 @@ mod tests {
         let root = std::env::temp_dir().join(format!("horizon-labpbr-{}", std::process::id()));
         let dir = root.join("assets/minecraft/optifine");
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(declared_format(&root), None);
+        let source = horizon_assets::resource_source::ResourceSource::directory(root.clone());
+        assert_eq!(declared_format(&source), None);
         std::fs::write(
             dir.join("texture.properties"),
             "# a pack\nformat = lab-pbr/1.3 # x\n",
         )
         .unwrap();
-        assert_eq!(declared_format(&root).as_deref(), Some("lab-pbr/1.3"));
+        assert_eq!(declared_format(&source).as_deref(), Some("lab-pbr/1.3"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
