@@ -110,7 +110,7 @@ impl Renderer {
         }
         // The layered frame's light eases into the peak, before the camera overlays draw on it,
         // unless a 0.2 pack's own `[tonemap]` did.
-        let pack_tonemap = self.native.as_ref().is_some_and(|n| n.tonemaps());
+        let pack_tonemap = self.executor.is_some_and(|c| c.tone_curve);
         if horizon_tone_curve(layered, !frame.title && scene.is_none(), pack_tonemap)
             && let Some(hdr) = &self.hdr
         {

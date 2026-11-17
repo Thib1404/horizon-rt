@@ -115,7 +115,7 @@ impl Game<'_> {
             "first_quarter",
             "waxing_gibbous",
         ];
-        let phase = phases[(self.view_day_time() / 24000).rem_euclid(8) as usize];
+        let phase = phases[sky.moon_phase as usize];
         // RT lighting draws the real moon in the sky too (terrain.wgsl `rt_moon_disc`).
         if !rt_sky {
             body(

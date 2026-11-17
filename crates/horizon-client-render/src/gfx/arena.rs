@@ -136,11 +136,11 @@ impl Arena {
         } else {
             wgpu::BufferUsages::VERTEX
         };
-        // Ray tracing's unpack pass reads sections here (`ray_scene`); BLAS builds read their
+        // Ray tracing's unpack pass reads sections here (`rt::scene`); BLAS builds read their
         // vertices here (RT lighting's `hw_rays`), and the shadow rays' alpha test their texture
         // coordinates.
-        usage |= super::surface_setup::ray_query::arena_input(device);
-        let blas = super::surface_setup::ray_query::blas_input(device);
+        usage |= super::rt::query::arena_input(device);
+        let blas = super::rt::query::blas_input(device);
         if !blas.is_empty() {
             usage |= blas | wgpu::BufferUsages::STORAGE;
         }

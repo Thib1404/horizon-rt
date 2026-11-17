@@ -13,7 +13,12 @@ use crate::{
 #[cfg(any(test, feature = "test-support"))]
 use glam::Vec4;
 use glam::{DVec3, Mat4, Vec3};
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 // RenderPipelines.CRUMBLING: dst * src + src * dst, alpha replaced.
@@ -454,10 +459,7 @@ pub(crate) mod core_lines;
 pub(crate) mod core_sky;
 pub(crate) mod core_text;
 mod cull;
-mod device_open;
 mod display_watch;
-pub use device_open::dx12_shader_cache;
-use device_open::{instance_descriptor, open_device};
 use display_watch::{DISPLAY_POLL, DisplayWatch, flush_display_log};
 mod dx12_compiler;
 mod end_sky;
@@ -477,6 +479,9 @@ pub(crate) mod hud_coverage;
 pub mod hw_micromaps;
 mod hw_rays;
 mod in_flight;
+mod material_animate;
+#[cfg(test)]
+mod material_animation_tests;
 pub use hdr::{Calibration as HdrCalibration, Output as HdrOutput};
 pub use output::{DisplayReading, EffectiveOutput, FrameConfiguration, FrameRequest};
 
@@ -531,8 +536,8 @@ mod rt_cloud_mesh;
 mod rt_clouds;
 mod rt_device;
 use rt_device::{
-    device_features, dual_source_terrain, hw_rt_features, linear_light_request, open_xr_device,
-    terrain_source, terrain_views,
+    device_features, dual_source_terrain, hw_rt_features, linear_light_request, terrain_source,
+    terrain_views,
 };
 mod rt_passes;
 mod rt_settings;
@@ -565,6 +570,7 @@ mod hdr_capture;
 // Temporal anti-aliasing for RT lighting (gfx/taa.rs).
 mod readback;
 mod reuse;
+mod rt;
 mod screenshot;
 pub use screenshot::{PendingScreenshot, ScreenshotSave};
 mod screenshot_readback;
@@ -582,6 +588,8 @@ mod tonemap;
 pub mod translucency;
 pub mod transmission;
 pub(crate) mod upload;
+mod upload_retry;
+use upload_retry::UploadRetries;
 mod view;
 mod view_sections;
 mod visbuffer;
@@ -601,6 +609,49 @@ use off_page::keyed_meshes;
 /// The world pass again after occlusion culling's test: it loads both
 /// targets (phase 2 draws over phase 1, reading the test's results).
 /// `LevelRenderer.addSkyPass`: fluids and camera effects block the sky pass.
+/// The fog colour and distances of the renderer's `Globals` (`fog_color`; `fog`: the
+/// environment's start and end, the render distance's start and end): what terrain.wgsl's
+/// `apply_fog` mixes, and what a shader pack that fogs its stages itself reads
+/// (`Frame.fog_environment`, `fog_render`).
+pub(crate) fn fog_uniform(frame: &Frame) -> ([f32; 4], [f32; 4]) {
+    if let Some(f) = frame.fog {
+        (
+            f.color,
+            [
+                f.environmental_start,
+                f.environmental_end,
+                f.render_distance_start,
+                f.render_distance_end,
+            ],
+        )
+    } else if frame.underwater {
+        (
+            [
+                frame.water_fog[0],
+                frame.water_fog[1],
+                frame.water_fog[2],
+                1.0,
+            ],
+            [-8.0, 96.0, -8.0, 96.0],
+        )
+    } else {
+        let d = frame.distance;
+        (
+            [
+                frame.sky.fog_color[0],
+                frame.sky.fog_color[1],
+                frame.sky.fog_color[2],
+                1.0,
+            ],
+            // FogRenderer: render-distance fog starts at max(d - 16, 0)... d.
+            {
+                let (start, end) = frame.environment_fog.unwrap_or((f32::MAX, f32::MAX));
+                [start, end, (d - d.min(64.0) * 0.25).max(0.0), d]
+            },
+        )
+    }
+}
+
 fn sky_open(frame: &Frame) -> bool {
     !frame.sky_blocked
 }
@@ -1474,8 +1525,8 @@ pub struct Renderer {
     /// Sections upload their solid quads in the compact layout (`mesher::packed`): the solid
     /// passes read the arena themselves (`flat`) and no shader pack reads it as vertices.
     packed_quads: bool,
-    /// The terrain's acceleration structures, with ray tracing on (`ray_scene`).
-    ray_scene: Option<surface_setup::ray_query::ray_scene::RayScene>,
+    /// The terrain's acceleration structures, with ray tracing on (`rt::scene`).
+    ray_scene: Option<rt::scene::RayScene>,
     /// The compact layout is allowed (`HORIZON_PACKED_QUADS`, `set_packed_layout`).
     packed_on: bool,
     /// The visibility buffer for flat frames' solid terrain (`visbuffer`,
@@ -1686,7 +1737,7 @@ pub struct Renderer {
     /// are maps (`set_parallax`).
     parallax: Option<parallax::Parallax>,
     parallax_on: bool,
-    material_animations: Vec<SpriteAnimation>,
+    material_animations: material_animate::MaterialAnimations,
     active_animated_layers: Vec<u64>,
     uploads: upload::Uploads,
     /// Section meshes are staged through their own belt into
@@ -1730,6 +1781,8 @@ pub struct Renderer {
     detail_columns: FxHashMap<(i32, i32), SectionMask>,
     /// Bumped whenever a column becomes or stops being complete.
     detail_revision: u64,
+    /// Sections whose mesh the arena refused (`upload`), waiting to be meshed again.
+    upload_retries: UploadRetries,
     arena: arena::Arena,
     /// Translucent quads' own arena, with large pages, while the layout is split
     /// (`translucent_split`): the back-to-front list then stays in one page (and
@@ -1942,6 +1995,8 @@ pub struct Renderer {
     pack_loading: Option<PackLoading>,
     /// The post passes of one of Horizon's own shader packs; never beside `pack_post`'s.
     native: Option<native_pack::NativePack>,
+    /// What it does in the renderer's place, kept from its install on (`replace_native`).
+    executor: Option<external::Capabilities>,
     /// Time the shader pack's passes on the GPU (F3, or a capture made with `--gpu`).
     pass_timing: bool,
     /// Times the parts of passes too (`set_pass_detail`).
@@ -2274,147 +2329,8 @@ pub struct PreparedTextures {
     /// The LabPBR maps' mip chains (normals, specular), their levels, layers and size.
     pbr: Option<(Vec<u8>, Vec<u8>, u32, u32, u32)>,
 }
-
-/// The window's display connection, so the OpenGL backend creates its EGL
-/// display from the X11 or Wayland connection the window lives on. Without
-/// one, wgpu-hal falls back to `EGL_MESA_platform_surfaceless`, whose configs
-/// cannot present to a window; the backend then reports the surface as
-/// incompatible and the game has no OpenGL to fall back to (`gl not
-/// compatible with provided surface`).
-#[derive(Debug, Clone)]
-struct WindowDisplay(Arc<Window>);
-impl wgpu::rwh::HasDisplayHandle for WindowDisplay {
-    fn display_handle(
-        &self,
-    ) -> std::result::Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
-        wgpu::rwh::HasDisplayHandle::display_handle(&*self.0)
-    }
-}
-/// Whether an adapter renders on the CPU (WARP, llvmpipe).
-fn is_software(kind: wgpu::DeviceType) -> bool {
-    kind == wgpu::DeviceType::Cpu
-}
-/// A device and what it came from.
-struct Opened {
-    instance: wgpu::Instance,
-    surface: Option<wgpu::Surface<'static>>,
-    adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    xr: Option<xr::Shared>,
-    device_lost: Arc<std::sync::atomic::AtomicBool>,
-    /// The window surface's configuration, set on `device` during the search, and the
-    /// surface's capabilities on `adapter`. None offscreen.
-    configured: Option<(wgpu::SurfaceConfiguration, wgpu::SurfaceCapabilities)>,
-}
-/// Logs the adapter and records it for crash reports.
-#[derive(Clone, Debug, Default)]
-pub struct Adapter {
-    pub name: String,
-    pub vendor: String,
-    /// `integrated`, `discrete`, `virtual`, `cpu` or `other`.
-    pub kind: String,
-    pub driver: String,
-    pub backend: String,
-}
-
-static ADAPTER: std::sync::Mutex<Option<Adapter>> = std::sync::Mutex::new(None);
-
-/// The adapter, once the renderer has one.
-pub fn adapter() -> Option<Adapter> {
-    ADAPTER.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-/// wgpu's device type in the words reports use.
-pub fn gpu_kind(device_type: &str) -> &'static str {
-    match device_type {
-        "IntegratedGpu" => "integrated",
-        "DiscreteGpu" => "discrete",
-        "VirtualGpu" => "virtual",
-        "Cpu" => "cpu",
-        _ => "other",
-    }
-}
-
-/// Logs the adapter and records it ([`adapter`]) for crash reports and telemetry.
-fn describe_adapter(adapter: &wgpu::Adapter) {
-    let info = adapter.get_info();
-    log::info!(
-        "Horizon renderer: {} ({:?}, {:?})",
-        info.name,
-        info.backend,
-        info.device_type
-    );
-    *ADAPTER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Adapter {
-        name: info.name.clone(),
-        vendor: horizon_system::gpu_vendor(&info.name, info.vendor).to_owned(),
-        kind: gpu_kind(&format!("{:?}", info.device_type)).to_owned(),
-        driver: format!("{} {}", info.driver, info.driver_info)
-            .trim()
-            .to_owned(),
-        backend: format!("{:?}", info.backend),
-    });
-    crate::crash::set_detail(
-        "Graphics Adapter",
-        format!(
-            "{} ({:?}, {:?}), driver {} {}",
-            info.name, info.backend, info.device_type, info.driver, info.driver_info
-        ),
-    );
-}
-/// Whether an adapter's texture arrays hold the block textures Horizon puts
-/// in one array.
-fn check_layers(adapter: &wgpu::Adapter, layers: u32) -> Result<u32> {
-    let info = adapter.get_info();
-    Ok(layer_split(
-        adapter.limits().max_texture_array_layers,
-        info.backend == wgpu::Backend::Gl,
-        adapter_requested_split(&info, requested_split(), layers),
-        layers,
-    )?)
-}
-/// Whether the swapchain can take a window of `width` x `height`: each side from 1 to the
-/// device's `max_texture_dimension_2d` (`max`), else `Surface::configure` panics. 0 is a
-/// minimized window. Past `max`: Windows lets a program size a window up to 65535 pixels
-/// (`SetWindowPos`), a 984x65496 client area, when an RTX 5080 takes 32768. Vanilla's
-/// `Window.onFramebufferResize` likewise keeps the last size for one that is not positive.
-fn drawable_size(width: u32, height: u32, max: u32) -> bool {
-    (1..=max).contains(&width) && (1..=max).contains(&height)
-}
-/// The swapchain format: a non-sRGB target, because vanilla blends and tints in gamma
-/// space, and 8-bit, because wgpu gives `Rgba16Float` the linear `ExtendedSrgb` color
-/// space: the compositor would read these gamma-encoded values as linear light and wash
-/// every colour out.
-fn surface_format(
-    formats: &[wgpu::TextureFormat],
-    default: wgpu::TextureFormat,
-) -> wgpu::TextureFormat {
-    [
-        wgpu::TextureFormat::Bgra8Unorm,
-        wgpu::TextureFormat::Rgba8Unorm,
-    ]
-    .into_iter()
-    .find(|f| formats.contains(f))
-    .or_else(|| formats.iter().copied().find(|f| !f.is_srgb()))
-    .unwrap_or(default)
-}
-/// Whether a format with the adapter's `format` features takes every usage and flag the
-/// passes take of the frame.
-fn draws_frame(format: wgpu::TextureFormatFeatures) -> bool {
-    format.allowed_usages.contains(
-        wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::COPY_DST,
-    ) && format.flags.contains(
-        wgpu::TextureFormatFeatureFlags::BLENDABLE | wgpu::TextureFormatFeatureFlags::FILTERABLE,
-    )
-}
-
-/// The frame under a shader API 0.2 pack, or with HDR on and no pack (hdr-linear-light.md):
-/// float, so values over 1 survive from the world to the tonemap and the HDR pass.
-const LINEAR_FRAME: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-
+mod device;
+pub use device::*;
 /// Logs a step of the renderer's start, for a native crash in the graphics
 /// driver: it leaves no panic or crash report, so the log's last line is the
 /// only sign of where the game stopped. The log file is written unbuffered;
@@ -2713,14 +2629,14 @@ impl Renderer {
             &device,
             Some(&layout),
             &shader,
-            config.format.remove_srgb_suffix(),
+            (frame_format, linear_light),
             &sprite_constants,
         );
         let terrain_model_pipelines = terrain_model::pipelines(
             &device,
             Some(&layout),
             &shader,
-            config.format.remove_srgb_suffix(),
+            (frame_format, linear_light),
             &sprite_constants,
         );
         let instance_attributes = wgpu::vertex_attr_array![5=>Float32x4];
@@ -3240,7 +3156,8 @@ impl Renderer {
                                 let mut data =
                                     data[start..start + used as usize * layer_bytes].to_vec();
                                 data.resize(layer_bytes * count as usize, 0);
-                                device.create_texture_with_data(
+                                upload::create_texture_with_data(
+                                    &device,
                                     &queue,
                                     &wgpu::TextureDescriptor {
                                         label: Some(label),
@@ -3258,7 +3175,6 @@ impl Renderer {
                                             | wgpu::TextureUsages::COPY_DST,
                                         view_formats: &[],
                                     },
-                                    wgpu::util::TextureDataOrder::LayerMajor,
                                     &data,
                                 )
                             },
@@ -3277,7 +3193,8 @@ impl Renderer {
                 // The extra layers are empty.
                 mips.resize(mips.len() / used as usize * count as usize, 0);
                 mip_levels = levels;
-                device.create_texture_with_data(
+                upload::create_texture_with_data(
+                    &device,
                     &queue,
                     &wgpu::TextureDescriptor {
                         label: Some("Block sprites"),
@@ -3297,16 +3214,11 @@ impl Renderer {
                             | wgpu::TextureUsages::STORAGE_BINDING,
                         view_formats: &[],
                     },
-                    wgpu::util::TextureDataOrder::LayerMajor,
                     &mips,
                 )
             })
             .collect();
-        let material_animations = animations
-            .iter()
-            .filter(|a| a.has_materials())
-            .cloned()
-            .collect();
+        let material_animations = material_animate::MaterialAnimations::new(animations);
         let animations = animate::SpriteAnimator::new(
             &device,
             animations,
@@ -3541,7 +3453,8 @@ impl Renderer {
             )
             .into());
         }
-        let atlas = device.create_texture_with_data(
+        let atlas = upload::create_texture_with_data(
+            &device,
             &queue,
             &wgpu::TextureDescriptor {
                 label: Some("Shared atlas"),
@@ -3560,7 +3473,6 @@ impl Renderer {
                     | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             },
-            wgpu::util::TextureDataOrder::LayerMajor,
             atlas_pixels,
         );
         let atlas_view = atlas.create_view(&Default::default());
@@ -4807,7 +4719,7 @@ impl Renderer {
             last_wait: std::time::Duration::ZERO,
             last_encode: std::time::Duration::ZERO,
             window,
-            ray_scene: surface_setup::ray_query::ray_scene::RayScene::forced(&device),
+            ray_scene: rt::scene::RayScene::forced(&device),
             device,
             reuse,
             queue: submit::Queue::new(queue, submit::wanted()),
@@ -4987,6 +4899,7 @@ impl Renderer {
             lod_pending: None,
             detail_columns: Default::default(),
             detail_revision: 0,
+            upload_retries: UploadRetries::default(),
             arena,
             translucent_arena,
             translucent_batching,
@@ -5087,6 +5000,7 @@ impl Renderer {
             pack_post: None,
             pack_loading: None,
             native: None,
+            executor: None,
             pass_timing: false,
             pass_detail: false,
             pass_timing_gap: std::time::Duration::ZERO,
@@ -5251,7 +5165,7 @@ impl Renderer {
         pass.draw(0..4, first..first + edges);
     }
     fn quad_indices(device: &wgpu::Device, quads: u32) -> wgpu::Buffer {
-        surface_setup::ray_query::quad_indices(device, quads)
+        rt::query::quad_indices(device, quads)
     }
     fn offscreen_target(
         device: &wgpu::Device,
@@ -5418,7 +5332,7 @@ impl Renderer {
     /// Whether one of Horizon's own packs reads the water mirror, which needs the frame's
     /// `water_plane`.
     pub fn wants_water_plane(&self) -> bool {
-        self.native.as_ref().is_some_and(|n| n.frame.reflects)
+        self.executor.is_some_and(|c| c.reflection)
     }
     /// Whether solid quads facing away from the eye are left out.
     pub fn section_sides(&self) -> bool {
@@ -5609,7 +5523,7 @@ impl Renderer {
     /// Whether one of Horizon's own packs with `[shadow]` draws, whose shadow pass takes the
     /// frame's `shadow_only` quads.
     pub fn native_shadow(&self) -> bool {
-        self.native.as_ref().is_some_and(|n| n.shadow.is_some())
+        self.executor.is_some_and(|c| c.shadow)
     }
     /// What a shader pack's shadow pass draws of the entities this frame: (entities or block
     /// entities other than the player, so those Horizon's culling hides from the camera are
@@ -5654,7 +5568,11 @@ impl Renderer {
     ) -> Option<bool> {
         self.occlusion.visible_for_camera(key, camera_section)
     }
-    pub fn upload(&mut self, key: SectionKey, mesh: &SectionMesh) {
+    /// Section `key`'s quads in, from `mesh`; whether the section has them now, a section
+    /// with no quads counting (there is nothing to draw). False when the arena had no room
+    /// for them: the mesh is gone once the game frees it, so the section is remembered here
+    /// (`queue_upload_retries`) and meshed again once memory allows.
+    pub fn upload(&mut self, key: SectionKey, mesh: &SectionMesh) -> bool {
         if let Some(copies) = &mut self.capture_copies {
             copies.section(key, mesh);
         }
@@ -5669,6 +5587,13 @@ impl Renderer {
         let facts = MeshFacts::of(mesh);
         let fading = self.before_mesh(key, &facts);
         let section = crate::spans::time("u_mesh", || self.upload_mesh(mesh));
+        let drawn = section.is_some() || facts.empty;
+        if drawn {
+            self.upload_retries.uploaded(key);
+        } else {
+            let quads = ((mesh.solid.len() + mesh.translucent.len()) / 4) as u32;
+            self.upload_retries.refused(key, Instant::now(), quads);
+        }
         self.after_mesh(key, &facts, section, fading);
         // The hardware rays' opacity micromaps of the mesh just placed (`hw_micromaps`).
         if let Some(hw) = &mut self.hw_rays
@@ -5684,6 +5609,18 @@ impl Renderer {
                 )
             });
         }
+        drawn
+    }
+    /// Puts the sections whose retry is due (`upload`) back in the mesh queue `dirty`
+    /// (`World::dirty_sections`), as an edit puts a changed section there: the game meshes
+    /// them again, and the next upload of them finds out whether the arena takes their
+    /// quads. How many went back.
+    pub fn queue_upload_retries(
+        &mut self,
+        dirty: &mut crate::world::DirtySections,
+        now: Instant,
+    ) -> usize {
+        self.upload_retries.queue_due(dirty, now)
     }
     /// Section `key`'s new mesh drawn from now on, its quads uploaded (`section`: none when it
     /// has none, or the arena had no room).
@@ -6326,6 +6263,7 @@ impl Renderer {
         if let Some(hw) = &mut self.hw_rays {
             hw.clear();
         }
+        self.upload_retries.clear();
         // A dimension change drops every page at once: freed later, off this thread.
         self.graveyard.add(self.arena.clear());
         if let Some(gpu) = &mut self.gpu_culling {
@@ -6516,6 +6454,13 @@ impl Renderer {
         let columns: Vec<(i32, i32)> = columns.into_iter().collect();
         if let Some(copies) = &mut self.capture_copies {
             copies.remove_columns(&columns);
+        }
+        if !self.upload_retries.is_empty() && !columns.is_empty() {
+            // Nothing meshes a section of a column that left the view: the retry would
+            // only fill the queue for a chunk that is gone.
+            let dropped: crate::fast_hash::FxHashSet<_> = columns.iter().copied().collect();
+            self.upload_retries
+                .retain_columns(|x, z| !dropped.contains(&(x, z)));
         }
         // Most of the view at once (a teleport at render distance 32 drops some 3700
         // columns): a pass over each store instead of a lookup per section key, which
@@ -6752,7 +6697,7 @@ impl Renderer {
                 self.frame_gen.on,
                 (self.pack_post.as_ref())
                     .map(|(_, p)| p.as_ref().is_some_and(|p| p.skins_entities())),
-                self.native.is_some(),
+                self.executor.is_some(),
                 || native_render::needs().entity_spans,
             )
     }
@@ -6973,51 +6918,49 @@ impl Renderer {
             active,
             self.own_timing.as_mut(),
         );
-        if let Some(arrays) = &self.pbr_maps {
-            for animation in &self.material_animations {
-                if !self.animations.changed().contains(&animation.layer) {
-                    continue;
-                }
-                let Some(pair) = arrays.get((animation.layer / self.sprite_split) as usize) else {
-                    continue;
-                };
-                for kind in 0..2 {
-                    let Some(pixels) = animation.material_pixels(kind, tick) else {
-                        continue;
+        if let Some(arrays) = &self.pbr_maps
+            && let Some(pair) = arrays.first()
+        {
+            let selected = self.animations.changed().iter().filter_map(|&layer| {
+                self.animations
+                    .current_frame(layer)
+                    .map(|frame| (layer, frame))
+            });
+            let size = pair[0].width();
+            let levels = pair[0].mip_level_count();
+            let changed = self.material_animations.animate(
+                selected,
+                size,
+                levels,
+                |layer, kind, level, size, pixels| {
+                    let Some(pair) = arrays.get((layer / self.sprite_split) as usize) else {
+                        return;
                     };
-                    let texture = &pair[kind];
-                    let from = (pixels.len() / 4).isqrt() as u32;
-                    for level in 0..texture.mip_level_count() {
-                        let size = texture.width() >> level;
-                        let pixels = crate::sprites::resample(pixels, from, size);
-                        self.uploads.texture(
-                            encoder,
-                            wgpu::TexelCopyTextureInfo {
-                                texture,
-                                mip_level: level,
-                                origin: wgpu::Origin3d {
-                                    x: 0,
-                                    y: 0,
-                                    z: animation.layer % self.sprite_split,
-                                },
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            size,
-                            size,
-                            &pixels,
-                        );
-                    }
-                }
-            }
-            if let Some(atlases) = &self.pack_material_atlases {
-                for kind in 0..2 {
-                    let arrays: Vec<_> = arrays.iter().map(|pair| pair[kind].clone()).collect();
-                    atlases[kind].copy(
-                        &self.device,
+                    self.uploads.texture(
                         encoder,
-                        &arrays,
-                        self.animations.changed().iter().copied(),
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &pair[kind],
+                            mip_level: level,
+                            origin: wgpu::Origin3d {
+                                x: 0,
+                                y: 0,
+                                z: layer % self.sprite_split,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        size,
+                        size,
+                        pixels,
                     );
+                },
+            );
+            if let Some(atlases) = &self.pack_material_atlases {
+                for (kind, layers) in changed.into_iter().enumerate() {
+                    if layers.is_empty() {
+                        continue;
+                    }
+                    let arrays: Vec<_> = arrays.iter().map(|pair| pair[kind].clone()).collect();
+                    atlases[kind].copy(&self.device, encoder, &arrays, layers);
                 }
             }
         }
@@ -7282,7 +7225,7 @@ impl Renderer {
             && !frame.title
             && frame.menu_blur.is_none()
             && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
-            && self.native.is_none()
+            && self.executor.is_none()
             && (self.surface.is_none()
                 || self.config.usage.contains(wgpu::TextureUsages::COPY_DST));
         if !fg {
@@ -7438,7 +7381,7 @@ impl Renderer {
             && self.tonemap.is_none()
             && self.eye.is_none()
             && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
-            && self.native.is_none();
+            && self.executor.is_none();
         let hdr_lighting = self.shader_pack_kind().is_none();
         if let Some(hdr) = &mut self.hdr {
             hdr.lighting = hdr_lighting && hdr.look;
@@ -7487,42 +7430,7 @@ impl Renderer {
         // RT lighting under water: the froxels' medium (Remix's water) is the fog, vanilla's
         // underwater one is pushed past the view (its render distance fog stays).
         let medium_fog = self.rt_lighting && self.froxels.enabled && frame.underwater;
-        let (fog_color, fog) = if let Some(f) = frame.fog {
-            (
-                f.color,
-                [
-                    f.environmental_start,
-                    f.environmental_end,
-                    f.render_distance_start,
-                    f.render_distance_end,
-                ],
-            )
-        } else if frame.underwater {
-            (
-                [
-                    frame.water_fog[0],
-                    frame.water_fog[1],
-                    frame.water_fog[2],
-                    1.0,
-                ],
-                [-8.0, 96.0, -8.0, 96.0],
-            )
-        } else {
-            let d = frame.distance;
-            (
-                [
-                    frame.sky.fog_color[0],
-                    frame.sky.fog_color[1],
-                    frame.sky.fog_color[2],
-                    1.0,
-                ],
-                // FogRenderer: render-distance fog starts at max(d - 16, 0)... d.
-                {
-                    let (start, end) = frame.environment_fog.unwrap_or((f32::MAX, f32::MAX));
-                    [start, end, (d - d.min(64.0) * 0.25).max(0.0), d]
-                },
-            )
-        };
+        let (fog_color, fog) = fog_uniform(frame);
         let fog = if medium_fog {
             [f32::MAX, f32::MAX, fog[2], fog[3]]
         } else {
@@ -7562,7 +7470,7 @@ impl Renderer {
         }
         let pack_post = !frame.title && self.pack_post.as_ref().is_some_and(|p| p.1.is_some());
         // One of Horizon's own packs reads the same world target.
-        let native_post = !frame.title && self.native.is_some();
+        let native_post = !frame.title && self.executor.is_some();
         // Linear Light (`tonemap`): the world in linear light, unless a shader pack draws it (its
         // programs expect vanilla's gamma-space colours; its output is decoded after it).
         let linear = self.tonemap.is_some();
@@ -7650,12 +7558,14 @@ impl Renderer {
                 aspect,
                 tan_half,
             ],
-            // With the view bobbing the world is drawn with (`view_projection`): the sky's rays
-            // (terrain.wgsl `view_ray`) bob with it, as vanilla's sky does, or the sun and its halo
-            // would sway against the landscape at each step.
+            // The sky turns with the view bob and the nausea spin, as the world,
+            // the sun and the clouds do. `GameRenderer.renderLevel` puts both into
+            // the projection the sky is drawn with; without them the sky stands
+            // still while everything else sways.
+            // VR: each eye's own view, without the bob.
             inverse_view: match &self.eye {
                 Some(_) => view.inverse(),
-                None => (frame.bob * view).inverse(),
+                None => views.primary().posed_view(pose).inverse(),
             }
             .to_cols_array_2d(),
             sunrise: frame.sky.sunrise_color,
@@ -7869,11 +7779,11 @@ impl Renderer {
             }
         }
         // The sunrise fan as sixteen triangles. Its clip positions use the sky's
-        // own view (no TAA jitter, bob or spin: `fs_sky`'s `view_ray` has none),
+        // own view (no TAA jitter; the bob and the spin, as `fs_sky`'s `view_ray`),
         // and its apex weight interpolates the barycentric the shader used to
         // compute for every sky pixel.
         if frame.sky.sunrise_color[3] > 0.001 && !frame.title && frame.skybox {
-            let sky_view_proj = views.primary().view_proj(Mat4::IDENTITY);
+            let sky_view_proj = views.primary().view_proj(pose);
             let mut mesh = [[0.0f32; 5]; sunrise_fan::VERTICES];
             for (to, from) in mesh
                 .iter_mut()
@@ -7978,9 +7888,7 @@ impl Renderer {
             .and_then(|p| p.shadow_view(frame))
             .or_else(|| {
                 // One of Horizon's own packs with `[shadow]` uses the same lists.
-                let native = self.native.as_ref().filter(|_| !frame.title)?;
-                native.shadow.as_ref()?;
-                native.frame.shadow_view(frame)
+                (self.native.as_ref().filter(|_| !frame.title)?).shadow_request(frame)
             })
             .or_else(|| {
                 self.external
@@ -8018,10 +7926,7 @@ impl Renderer {
         // `visible`. Decided before the walk, so that a pass whose buffers no longer fit can
         // still switch GPU culling off.
         let radius = (frame.detail_distance / 16.0) as i32;
-        let displaced = self
-            .native
-            .as_ref()
-            .is_some_and(native_pack::NativePack::displaces);
+        let displaced = self.executor.is_some_and(|c| c.displacement);
         let mut gpu_frame = self.gpu_culling.is_some()
             // The eyes draw the CPU's lists, the second eye the first one's (`xr`).
             && self.eye.is_none()
@@ -9010,7 +8915,7 @@ impl Renderer {
             - native_solid_quads
             - native_cutout_quads
             - native_cutout_mipped_quads;
-        let native_clouds = self.native.as_ref().is_none_or(|n| n.vanilla_clouds);
+        let native_clouds = self.executor.is_none_or(|c| !c.hides_clouds);
         let cloud_quads = if let Some(input) = frame.clouds.as_ref().filter(|_| native_clouds) {
             let (rebuilt, uniform) =
                 crate::spans::time("clouds", || self.cloud_mesh.prepare(input));
@@ -9428,7 +9333,7 @@ impl Renderer {
                 flat.page_instances = self.visbuf.is_some()
                     && !pack_terrain
                     && shadow_view.is_none()
-                    && self.native.as_ref().is_none_or(|n| n.material.is_none());
+                    && self.executor.is_none_or(|c| !c.material);
                 let sections = &self.sections;
                 let lods = &self.lods;
                 let (sorted, lists) = (&self.sorted_indices, &self.world_views.sections);
@@ -9528,7 +9433,7 @@ impl Renderer {
         }
         let pack_post = !frame.title && self.pack_post.as_ref().is_some_and(|p| p.1.is_some());
         // One of Horizon's own packs reads the same world target.
-        let native_post = !frame.title && self.native.is_some();
+        let native_post = !frame.title && self.executor.is_some();
         if rt.aldhani[0] >= 0.0 {
             self.aldhani
                 .run(&self.device, &mut self.uploads, &mut encoder, rt.aldhani[0]);
@@ -10000,7 +9905,7 @@ impl Renderer {
             let group = (parallax::GROUP, &p.group);
             Some(native_material::TerrainLayers::own(&p.pipelines, group))
         });
-        let entity_stage = native.and_then(|n| Some((n.entity.as_ref()?, &n.frame.group)));
+        let entity_stage = native.and_then(|n| n.entities());
         // Without HDR output, the solid shaders without its lighting (`SolidPipeline`).
         let hdr = self.hdr.is_some();
         let solid_pipeline = material.map_or(self.solid.get(hdr), |m| m.solid);
@@ -10270,7 +10175,9 @@ impl Renderer {
                     if frame.end_sky {
                         self.end_sky.draw(&mut pass);
                         // The End's custom sky layers go over its sky box.
-                        if self.custom_sky.is_drawing() && !pack_draws_sky && self.native.is_none()
+                        if self.custom_sky.is_drawing()
+                            && !pack_draws_sky
+                            && self.executor.is_none()
                         {
                             self.custom_sky.draw(&mut pass);
                             pass.set_pipeline(&self.celestial.added);
@@ -10278,29 +10185,26 @@ impl Renderer {
                         }
                     }
                     if celestial_vertices > 0 && !pack_draws_celestial {
-                        // The Overworld's bodies start with the sun's quad
-                        // (`Game::celestial_geometry`): a pack sky drawing its own skips it.
-                        let own_sun = !frame.end_sky
-                            && self
-                                .native
-                                .as_ref()
-                                .is_some_and(native_pack::NativePack::hides_sun);
-                        let first = if own_sun { 6 } else { 0 };
+                        // The Overworld's bodies are the sun's quad and the moon's
+                        // (`Game::celestial_geometry`): a pack sky drawing its own skips one.
+                        let own = |hides: fn(&external::Capabilities) -> bool| {
+                            !frame.end_sky && self.executor.as_ref().is_some_and(hides)
+                        };
+                        let own_sun = own(|c| c.hides_sun);
+                        let own_moon = own(|c| c.hides_moon);
                         // A resource pack's core/sky isn't vanilla's sky times the sky's
                         // lift, which the sun's disc pass assumes: today's add there.
                         let lifted = hdr_gain
                             && self.hdr.as_ref().is_some_and(|h| h.lighting)
                             && !self.core_sky.as_ref().is_some_and(|c| c.draws_disc());
-                        let bodies = first..(celestial_vertices as u32 / 4) * 6;
+                        let quads = &frame.celestial[..celestial_vertices];
+                        let bodies = celestial::bodies(quads, own_sun, own_moon);
                         pass.set_vertex_buffer(0, self.celestial_buffer.slice(..));
                         self.celestial.draw_bodies(&mut pass, lifted, bodies);
                     }
                     pass.set_bind_group(0, &self.group, &[]);
                 }
-                let own_stars = self
-                    .native
-                    .as_ref()
-                    .is_some_and(native_pack::NativePack::hides_stars);
+                let own_stars = self.executor.is_some_and(|c| c.hides_stars);
                 if !frame.title && frame.stars.is_some() && !pack_draws_sky && !own_stars && !rt_sky
                 {
                     match self.core_sky.as_ref().filter(|c| c.draws_stars()) {
@@ -12111,6 +12015,125 @@ mod frame_policy_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    /// #16769: a graphics driver that never answers the device search must end the
+    /// start with a message, not hold it on the boot screen forever.
+    #[test]
+    fn an_unanswered_device_search_fires_the_watchdog() {
+        let (fired, fired_back) = std::sync::mpsc::channel();
+        let searched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _armed = super::arm_search_watchdog(
+            Duration::from_millis(20),
+            Duration::from_millis(0),
+            searched,
+            || {},
+            move || {
+                let _ = fired.send(());
+            },
+        );
+        fired_back
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the watchdog fired at the timeout");
+    }
+
+    /// The disarm itself proves it: the watchdog thread is joined, not slept past.
+    #[test]
+    fn a_disarmed_watchdog_does_not_fire() {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let also = fired.clone();
+        let searched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (disarm, watchdog) = super::arm_search_watchdog(
+            Duration::from_millis(20),
+            Duration::from_millis(0),
+            searched,
+            || {},
+            move || {
+                also.store(true, std::sync::atomic::Ordering::Relaxed);
+            },
+        );
+        disarm.send(()).expect("the watchdog was there to disarm");
+        watchdog
+            .expect("the watchdog thread started")
+            .join()
+            .expect("the watchdog thread ends on its disarm");
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::Relaxed),
+            "a finished search is not reported as a hung driver"
+        );
+    }
+
+    /// A search that answers inside the grace window was slow, not hung: it must not end
+    /// the start it had just finished (#16769).
+    #[test]
+    fn a_search_that_answers_inside_the_grace_runs_on() {
+        let (timeout_tx, timeout_rx) = std::sync::mpsc::channel();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let also = fired.clone();
+        let searched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (disarm, watchdog) = super::arm_search_watchdog(
+            Duration::from_millis(20),
+            Duration::from_millis(400),
+            searched.clone(),
+            move || {
+                timeout_tx.send(()).unwrap();
+            },
+            move || {
+                also.store(true, std::sync::atomic::Ordering::Relaxed);
+            },
+        );
+        // Past the timeout, inside the grace: this is the window the grace exists for.
+        timeout_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timeout reported before grace");
+        assert!(!fired.load(std::sync::atomic::Ordering::Relaxed));
+        searched.store(true, std::sync::atomic::Ordering::Release);
+        drop(disarm);
+        watchdog
+            .expect("the watchdog thread started")
+            .join()
+            .expect("the watchdog thread ends");
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::Relaxed),
+            "a slow search that answered is not a hung driver"
+        );
+    }
+
+    #[test]
+    fn the_timeout_message_names_the_stuck_api_and_the_remedy() {
+        let message = super::device_search_timed_out(Duration::from_secs(30));
+        assert!(message.contains("Horizon renderer:"), "{message}");
+        assert!(message.contains("HORIZON_GRAPHICS_API"), "{message}");
+    }
+
+    /// A machine whose driver is slow but alive can be talked out of the default.
+    #[test]
+    fn the_timeout_can_be_raised_and_ignores_what_is_not_a_positive_whole_number() {
+        use super::parse_device_open_timeout;
+        use std::time::Duration;
+        assert_eq!(
+            parse_device_open_timeout(Some("90")),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            parse_device_open_timeout(Some(" 45 ")),
+            Duration::from_secs(45)
+        );
+        for bad in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-5"),
+            Some("30s"),
+            Some("soon"),
+        ] {
+            assert_eq!(
+                parse_device_open_timeout(bad),
+                super::DEVICE_OPEN_TIMEOUT,
+                "{bad:?} keeps the default"
+            );
+        }
+    }
+
     #[test]
     fn taa_culling_covers_jittered_view_edges_but_still_rejects_behind_the_camera() {
         use super::*;
@@ -12729,7 +12752,7 @@ mod tests {
     }
     #[test]
     fn auto_uses_directx_12_first_on_windows_arm64() {
-        use super::{GraphicsApi, device_open::backend_order};
+        use super::{GraphicsApi, backend_order};
         use wgpu::Backends;
         let order = |api, os, arch| backend_order(api, os, arch, false);
         assert_eq!(
@@ -12775,7 +12798,7 @@ mod tests {
     }
     #[test]
     fn a_chosen_api_without_a_gpu_tries_the_others_before_software() {
-        use super::{GraphicsApi, device_open::device_search};
+        use super::{GraphicsApi, device_search};
         use wgpu::Backends;
         let (v, d, g) = (Backends::VULKAN, Backends::DX12, Backends::GL);
         let search = |api, os, arch| device_search(api, os, arch, false);
@@ -12928,7 +12951,7 @@ mod tests {
                 // occlusion test is appended to gpu_culling.wgsl, on Vulkan alone.
                 continue;
             } else if name == "rt_unpack.wgsl" {
-                // Appended to terrain.wgsl (`ray_scene`'s `Unpacker`), on ray tracing devices.
+                // Appended to terrain.wgsl (`rt::scene`'s `Unpacker`), on ray tracing devices.
                 continue;
             } else if name == "terrain.wgsl"
                 || name == "entity.wgsl"
@@ -13791,302 +13814,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod sprite_upload_tests {
-    use super::*;
-    #[test]
-    fn real_rail_mips_do_not_change_with_larger_array_layers() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client")
-            .join(horizon_core::VANILLA_VERSION);
-        if !root
-            .join("assets/minecraft/textures/block/rail.png")
-            .exists()
-        {
-            return;
-        }
-        let mut sprites = crate::sprites::Sprites::new(
-            crate::resource_source::ResourceSource::directory(root.clone()),
-        );
-        let layers: Vec<_> = [
-            "rail",
-            "powered_rail",
-            "powered_rail_on",
-            "detector_rail",
-            "activator_rail",
-        ]
-        .map(|name| sprites.insert(&format!("minecraft:block/{name}")).unwrap())
-        .into();
-        sprites.finish();
-        assert_eq!(sprites.size, 16);
-        let native: Vec<_> = layers
-            .iter()
-            .map(|&layer| {
-                let start = layer as usize * 16 * 16 * 4;
-                mip_chain(
-                    &sprites.pixels[start..start + 16 * 16 * 4],
-                    16,
-                    &sprites.mips,
-                    layer,
-                    1,
-                )
-                .0
-            })
-            .collect();
-        sprites.insert("minecraft:block/oak_sign").unwrap();
-        sprites.finish();
-        assert_eq!(sprites.size, 32);
-        for (&layer, expected) in layers.iter().zip(native) {
-            let start = layer as usize * 32 * 32 * 4;
-            let (actual, _) = mip_chain(
-                &sprites.pixels[start..start + 32 * 32 * 4],
-                32,
-                &sprites.mips,
-                layer,
-                1,
-            );
-            assert_eq!(&actual[32 * 32 * 4..], expected, "rail layer {layer}");
-        }
-    }
-    #[test]
-    fn prepared_texture_uploads_preserve_layer_order_and_settings() {
-        let size = 4;
-        let layers = 5;
-        let pixels: Vec<u8> = (0..size * size * layers)
-            .flat_map(|i| [i as u8, (i * 3) as u8, 99, if i % 3 == 0 { 0 } else { 255 }])
-            .collect();
-        let settings: Vec<_> = (0..layers)
-            .map(|i| crate::mipmap::Settings {
-                strategy: if i % 2 == 0 {
-                    crate::mipmap::Strategy::Mean
-                } else {
-                    crate::mipmap::Strategy::StrictCutout
-                },
-                ..Default::default()
-            })
-            .collect();
-        let border = [20, 30, 40, 128].repeat(16);
-        let expected = mip_chain(&pixels, size, &settings, 0, layers);
-        // A partial final array and an exact boundary exercise the global
-        // layer offset used to select each sprite's mipmap settings.
-        for split in [1, 2, 5, 8] {
-            let prepared = PreparedTextures::with_split(
-                &pixels,
-                size,
-                layers,
-                &settings,
-                (&border, size),
-                split,
-            );
-            assert_eq!(prepared.sprites.len(), layers.div_ceil(split) as usize);
-            let actual: Vec<_> = prepared
-                .sprites
-                .iter()
-                .flat_map(|(bytes, levels)| {
-                    assert_eq!(*levels, expected.1);
-                    bytes.iter().copied()
-                })
-                .collect();
-            assert_eq!(actual, expected.0);
-            assert_eq!(prepared.forcefield, mip_chain(&border, size, &[], 0, 1));
-            // Chains cut before the adapter was known, cut again for it.
-            for to in [1, 2, 3, 5, 8] {
-                let direct = PreparedTextures::with_split(
-                    &pixels,
-                    size,
-                    layers,
-                    &settings,
-                    (&border, size),
-                    to,
-                );
-                let resplit = PreparedTextures::with_split(
-                    &pixels,
-                    size,
-                    layers,
-                    &settings,
-                    (&border, size),
-                    split,
-                )
-                .resplit(layers, to);
-                assert_eq!(resplit.split, to);
-                assert_eq!(resplit.sprites, direct.sprites, "{split} -> {to}");
-            }
-        }
-    }
-
-    /// The chains are made a chunk of layers at a time, each on its own thread. Their
-    /// bytes must be the ones one thread making every layer in turn gives, in layer
-    /// order, whichever layer a chunk starts at.
-    #[test]
-    fn mip_chains_match_one_thread_making_every_layer() {
-        let size: u32 = 8;
-        let layers: u32 = 40;
-        let pixels: Vec<u8> = (0..size * size * layers)
-            .flat_map(|i| [i as u8, (i * 7) as u8, 33, if i % 5 == 0 { 0 } else { 255 }])
-            .collect();
-        let settings: Vec<_> = (0..layers)
-            .map(|i| crate::mipmap::Settings {
-                strategy: match i % 3 {
-                    0 => crate::mipmap::Strategy::Mean,
-                    1 => crate::mipmap::Strategy::Cutout,
-                    _ => crate::mipmap::Strategy::DarkCutout,
-                },
-                alpha_cutoff_bias: (i % 4) as f32 / 4.0,
-                item: i % 7 == 0,
-                ..Default::default()
-            })
-            .collect();
-        let layer_bytes = (size * size * 4) as usize;
-        let levels = size.trailing_zeros();
-        let chain_bytes: usize = (0..=levels).map(|l| layer_bytes >> (2 * l)).sum();
-        let mut expected: Vec<u8> = Vec::new();
-        for (layer, s) in settings.iter().copied().enumerate() {
-            let base = crate::mipmap::Image {
-                width: size,
-                height: size,
-                pixels: pixels[layer * layer_bytes..(layer + 1) * layer_bytes]
-                    .as_chunks::<4>()
-                    .0
-                    .to_vec(),
-            };
-            let has_transparent = s.has_transparent || base.pixels.iter().any(|p| p[3] == 0);
-            for image in crate::mipmap::generate(
-                base,
-                levels,
-                crate::mipmap::Settings {
-                    has_transparent,
-                    ..s
-                },
-            ) {
-                expected.extend(image.pixels.iter().flatten());
-            }
-        }
-        assert_eq!(expected.len(), chain_bytes * layers as usize);
-        assert_eq!(mip_chain(&pixels, size, &settings, 0, layers).0, expected);
-        // From the middle: the chunk's settings still come from the global layer index.
-        let from = (layers / 2) as usize;
-        let chain = mip_chain(
-            &pixels[from * layer_bytes..],
-            size,
-            &settings,
-            from as u32,
-            layers / 2,
-        );
-        assert_eq!(chain.0, expected[from * chain_bytes..]);
-    }
-
-    #[test]
-    fn sprite_split_follows_the_adapters_layer_limit() {
-        // The Discord report: 512 layers per array, 1291 block textures (3 arrays).
-        assert_eq!(layer_split(512, false, None, 1291), Ok(512));
-        assert_eq!(layer_split(512, true, None, 1291), Ok(512));
-        assert_eq!(layer_split(2048, false, None, 1291), Ok(SPRITE_SPLIT));
-        assert_eq!(layer_split(8192, false, None, 1291), Ok(SPRITE_SPLIT));
-        // HORIZON_SPRITE_SPLIT only lowers it.
-        assert_eq!(layer_split(2048, false, Some(512), 1291), Ok(512));
-        assert_eq!(layer_split(256, false, Some(512), 1291), Ok(256));
-        // OpenGL pads a multiple of 6 by a layer: a full array must still fit.
-        assert_eq!(layer_split(600, true, None, 1291), Ok(599));
-        assert_eq!(layer_split(600, false, None, 1291), Ok(600));
-        assert_eq!(array_layers(599, true), 599);
-        // Past the arrays terrain.wgsl binds.
-        assert_eq!(layer_split(256, false, None, 256 * SPRITE_ARRAYS), Ok(256));
-        let err = layer_split(128, false, None, 1291).unwrap_err();
-        assert!(err.contains("128 texture layers per array"), "{err}");
-        assert!(layer_split(512, false, None, 512 * SPRITE_ARRAYS + 1).is_err());
-    }
-
-    #[test]
-    fn metal_uses_a_conservative_default_split_but_respects_overrides() {
-        let mut info = wgpu::AdapterInfo {
-            name: "test adapter".into(),
-            vendor: 0,
-            device: 0,
-            device_type: wgpu::DeviceType::IntegratedGpu,
-            device_pci_bus_id: String::new(),
-            driver: String::new(),
-            driver_info: String::new(),
-            backend: wgpu::Backend::Vulkan,
-            subgroup_min_size: 0,
-            subgroup_max_size: 0,
-            transient_saves_memory: None,
-            limit_bucket: None,
-        };
-        info.backend = wgpu::Backend::Metal;
-        assert_eq!(adapter_requested_split(&info, None, 1200), Some(512));
-        assert_eq!(
-            adapter_requested_split(&info, None, 512 * SPRITE_ARRAYS),
-            Some(512)
-        );
-        assert_eq!(adapter_requested_split(&info, Some(1024), 1200), Some(1024));
-        // More sprites than the arrays hold at 512: the arrays grow, up to the GPU's layers.
-        let split = adapter_requested_split(&info, None, 10_271);
-        assert_eq!(split, Some(1284));
-        assert_eq!(layer_split(2048, false, split, 10_271), Ok(1284));
-        let split = adapter_requested_split(&info, None, 2048 * SPRITE_ARRAYS + 1);
-        assert!(layer_split(2048, false, split, 2048 * SPRITE_ARRAYS + 1).is_err());
-
-        info.backend = wgpu::Backend::Vulkan;
-        assert_eq!(adapter_requested_split(&info, None, 10_271), None);
-    }
-
-    #[test]
-    fn broken_haswell_vulkan_detects_haswell_and_leaves_ivy_bridge() {
-        let mut info = wgpu::AdapterInfo {
-            name: "Intel(R) HD Graphics 4400 (HSW GT2)".into(),
-            vendor: 0x8086,
-            device: 0x0a16,
-            device_type: wgpu::DeviceType::IntegratedGpu,
-            device_pci_bus_id: String::new(),
-            driver: "Mesa 26.2.5".into(),
-            driver_info: "Mesa 26.2.5".into(),
-            backend: wgpu::Backend::Vulkan,
-            subgroup_min_size: 0,
-            subgroup_max_size: 0,
-            transient_saves_memory: None,
-            limit_bucket: None,
-        };
-        assert!(super::device_open::is_broken_haswell_vulkan(&info));
-
-        // Ivy Bridge keeps Vulkan (#4059)
-        info.name = "Intel(R) HD Graphics 4000 (IVB GT2)".into();
-        info.device = 0x0166;
-        assert!(!super::device_open::is_broken_haswell_vulkan(&info));
-
-        // Haswell on OpenGL is stable (crocus)
-        info.name = "Intel(R) HD Graphics 4400 (HSW GT2)".into();
-        info.device = 0x0a16;
-        info.backend = wgpu::Backend::Gl;
-        assert!(!super::device_open::is_broken_haswell_vulkan(&info));
-    }
-
-    #[test]
-    fn mip_chain_allocates_exactly_its_size() {
-        for size in [16, 64] {
-            let animation = crate::sprites::test_animation(size, 0);
-            let (chain, _) = mip_chain(animation.pixels(0), size, &[], 0, 1);
-            assert_eq!(chain.capacity(), chain.len());
-        }
-    }
-
-    #[test]
-    fn collect_animated_layers_masks_opaque_layer() {
-        use crate::mesher::{self, SectionMesh, TerrainVertex};
-        let opaque_vertex =
-            TerrainVertex::new([0.0, 0.0, 0.0], [0.0, 0.0], 7 | mesher::OPAQUE_LAYER, 0, 0);
-        let translucent_vertex = TerrainVertex::new([0.0, 0.0, 0.0], [0.0, 0.0], 12, 0, 0);
-        let mut mesh = SectionMesh {
-            solid: vec![opaque_vertex; 4],
-            translucent: vec![translucent_vertex; 4],
-            ..Default::default()
-        };
-        mesh.note_sprite_layer(7 | mesher::OPAQUE_LAYER);
-        mesh.note_sprite_layer(12);
-        mesh.finish_sprite_layers();
-
-        let animated = super::collect_animated_layers(&mesh, |layer| layer == 7 || layer == 12);
-        assert_eq!(&*animated, &[7, 12]);
-    }
-}
+mod sprite_upload_tests;
 
 #[cfg(test)]
 mod shadow_face_tests {

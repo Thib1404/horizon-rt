@@ -49,9 +49,10 @@ mod post {
     pub struct PackPost { pub entities: Option<Entities>, pub shadow_targets: Option<()> }
     impl PackPost { __CASTERS__ }
 }
-struct Native { shadow: Option<()> }
+#[derive(Clone, Copy)]
+struct Capabilities { shadow: bool }
 struct Renderer {
-    pack_post: Option<(i32, Option<post::PackPost>)>, native: Option<Native>,
+    pack_post: Option<(i32, Option<post::PackPost>)>, executor: Option<Capabilities>,
     rt_shadows: bool, rt_lighting: bool, hw_rays: Option<()>,
 }
 impl Renderer { __NATIVE__ __GETTER__ __RAYS__ }
@@ -91,7 +92,7 @@ fn scene(kind: &str, dim: Dim, enabled: bool, sprite: bool) -> Game {
         dim,
         renderer: (kind != "no_renderer").then_some(Renderer {
             pack_post,
-            native: (kind == "native").then_some(Native { shadow: Some(()) }),
+            executor: (kind == "native").then_some(Capabilities { shadow: true }),
             rt_shadows: kind == "rt_shadows",
             rt_lighting: kind == "rt_lighting" || kind == "rt_voxels",
             hw_rays: (kind == "rt_shadows" || kind == "rt_lighting").then_some(()),

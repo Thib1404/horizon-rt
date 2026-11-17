@@ -9,6 +9,7 @@ mod fluid;
 mod fluid_surface;
 mod leaf_culling;
 mod lighting;
+pub mod meshlet;
 mod mod_geometry;
 mod mod_tint;
 pub mod packed;

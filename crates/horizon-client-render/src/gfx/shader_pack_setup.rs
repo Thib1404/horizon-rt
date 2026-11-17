@@ -140,7 +140,7 @@ impl Renderer {
     /// The running shader pack's kind: `iris` (a `shaders/` pack) or `native` (one of
     /// Horizon's own).
     pub fn shader_pack_kind(&self) -> Option<&'static str> {
-        match (&self.pack_post, &self.native) {
+        match (&self.pack_post, self.executor) {
             (Some((_, Some(_))), _) => Some("iris"),
             (_, Some(_)) => Some("native"),
             _ => None,
@@ -378,7 +378,9 @@ impl Renderer {
             &constants,
             lights,
         )?;
-        self.replace_native(Some(pack));
+        if let Some(refused) = self.replace_native(Some(pack)) {
+            return Err(refused);
+        }
         self.pack_post = None;
         self.pack_atlas = None;
         self.pack_material_atlases = None;

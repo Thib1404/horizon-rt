@@ -5,9 +5,9 @@ use super::{
     Renderer, check_layers, describe_adapter, device_features, hw_rt_features, is_software,
     startup_step, surface_format,
 };
-// Ray tracing on request, which the device needs from its creation (gfx.rs may not grow).
-#[path = "ray_query.rs"]
-pub(super) mod ray_query;
+// Mesh shader capability negotiation on request (spec #17243 step 1).
+#[path = "mesh_shader.rs"]
+pub(super) mod mesh_shader;
 use std::sync::Arc;
 use winit::window::Window;
 
@@ -150,8 +150,10 @@ pub(super) async fn open_adapter(
     // (`MC_GL_KHR_shader_subgroup_*`); storage buffers in vertex shaders, clearing and
     // atomics on images: their buffers and images. Filtering 32-bit float textures: shader
     // packs' RGBA32F buffers, which GL filters and mipmaps. Count draws: GPU culling's (`gpu_culling`).
-    // Hardware ray queries on request (`ray_query`), and RT lighting's (`hw_rays`) below.
-    let features = device_features(adapter) | ray_query::features(adapter, needs.rays);
+    // Hardware ray queries on request (`rt::query`), and RT lighting's (`hw_rays`) below.
+    let features = device_features(adapter)
+        | super::rt::query::features(adapter, needs.rays)
+        | mesh_shader::features(adapter);
     let driver = format!("{} {}", info.driver, info.driver_info);
     startup_step(format_args!(
         "requesting the device (driver {}) with features [{features}] and the adapter's \
@@ -192,7 +194,7 @@ pub(super) async fn open_adapter(
         experimental_features: if hw_rt {
             horizon_hdr::ray_query_features()
         } else {
-            ray_query::experimental(features)
+            mesh_shader::experimental(features)
         },
         ..Default::default()
     };
